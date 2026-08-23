@@ -1,0 +1,25 @@
+{
+  "name": "xteam",
+  "version": "1.1.0",
+  "description": "Cross-session file coordination + group chat for Claude Code & Codex — locks, presence, shared chat. Zero config, cross-platform.",
+  "license": "MIT",
+  "bin": {
+    "xteam": "install.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ji4ozhu/xteam.git"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "skill",
+    "coordination",
+    "multi-agent",
+    "locks",
+    "group-chat"
+  ]
+}
