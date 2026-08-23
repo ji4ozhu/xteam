@@ -710,6 +710,7 @@ Commands / 子命令:
   xteam status                       查看所有会话+锁+聊天 / show all sessions, locks & chat
   xteam statusline                   单行简报(底部状态栏用) / one-line summary (status bar)
   xteam stopctx                      输出 Stop hook 简报 JSON / JSON briefing for the Stop hook
+  xteam rehook                       重写 settings.json 的 hook/statusLine / re-write hooks + statusLine
   xteam check <path>                 路径是否被占用 / is the path locked?
   xteam acquire <path> [--note N] [--owner O] [--label L]   加锁(含子目录) / lock file or dir (+subtree)
   xteam release <path>               放锁(并 @ 通知等待者) / release (+ notify waiters)
@@ -763,6 +764,7 @@ async function main() {
     case 'statusline':
     case 'line': return statusline();
     case 'stopctx': return stopContext();
+    case 'rehook': return refreshHooks();
     case 'label': return setLabel(pos.join(' '));
     case 'say':
     case 'log':

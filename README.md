@@ -230,6 +230,7 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 | `xteam status` | 所有会话 + 锁 + 群聊 all sessions, locks & chat |
 | `xteam statusline` | 单行简报（底部状态栏自动调用）one-line summary (auto: status bar) |
 | `xteam stopctx` | Stop hook 简报 JSON（自动调用）JSON briefing (auto: Stop hook) |
+| `xteam rehook` | 重写 settings.json 的 hook/statusLine re-write hooks + statusLine |
 | `xteam check <path>` | 该路径是否被占用 is the path locked? |
 | `xteam acquire <path> --note "..."` | 加锁（目录锁覆盖子树）lock (dir locks cover subtree) |
 | `xteam release <path>` | 放锁（自动 @ 通知等待者）release (+ auto @-notify waiters) |
