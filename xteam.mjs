@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const REPO_RAW = 'https://raw.githubusercontent.com/ji4ozhu/xteam/main';
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));   // ~/.claude/skills/xteam
 const SKILL_DIR = SELF_DIR;
@@ -510,43 +510,6 @@ function statusline() {
   console.log(seg.join(' | '));
 }
 
-// JSON envelope for the Stop hook: injects a fresh briefing into the NEXT
-// turn's context as a system reminder, so the model stays aware of who holds
-// what without the user re-pasting anything. Plain-text stdout would be
-// discarded — only this hookSpecificOutput shape reaches the model.
-function stopContext() {
-  const me = registerPresence();
-  const locks = listLocks();
-  const pres = listPresence();
-  const chat = chatTail(STATUS_CHAT);
-  const now = nowSec();
-  const heldBy = {};
-  for (const m of locks) {
-    const o = m.owner || '?';
-    (heldBy[o] = heldBy[o] || []).push(m.path);
-  }
-  const active = pres.filter((p) => now - (p.lastSeenAt || 0) <= TTL);
-  const mine = heldBy[me] || [];
-  const others = active.filter((p) => p.owner !== me);
-  const orphaned = locks.filter((m) => lockState(m).tag === 'orphaned');
-
-  const L = [];
-  L.push(`[xteam 简报] ${active.length} 会话在线 · ${locks.length} 锁 · 群聊 ${chat.length} 条。`);
-  L.push(`你(${displayName(me)})持有: ${mine.length ? mine.join(', ') : '无锁'}。`);
-  if (others.length) {
-    const info = others.map((p) => {
-      const h = heldBy[p.owner] || [];
-      return `${displayName(p.owner)}${h.length ? `[锁:${h.join(',')}]` : '[无锁]'}`;
-    }).join('; ');
-    L.push(`其他会话: ${info}。`);
-  }
-  if (orphaned.length) {
-    L.push(`无主锁可接管: ${orphaned.map((m) => m.path).join(', ')}。`);
-  }
-  L.push('铁律: 改文件前 xteam acquire，改完 xteam release --all；接洽用 xteam say。');
-  console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'Stop', additionalContext: L.join('\n') } }));
-}
-
 function ts() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
@@ -646,7 +609,14 @@ function refreshHooks() {
     matcher: 'Edit|Write|MultiEdit|NotebookEdit',
     hooks: [{ type: 'command', command: `node "${scriptFwd}" preedit` }],
   });
-  ensure('Stop', { hooks: [{ type: 'command', command: `node "${scriptFwd}" stopctx` }] });
+  // v1.3.1: the Stop hook (additionalContext) caused an auto-reinvoke loop in
+  // some backends — remove any leftover xteam Stop hook so old installs heal.
+  if (settings.hooks && settings.hooks.Stop) {
+    settings.hooks.Stop = settings.hooks.Stop.filter(
+      (g) => !(g.hooks || []).some((h) => String(h.command || '').includes('xteam.mjs'))
+    );
+    if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
+  }
   settings.statusLine = { type: 'command', command: `node "${scriptFwd}" statusline`, padding: 0 };
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   console.log('  ✔ 已刷新 hook + statusLine');
@@ -709,7 +679,6 @@ function help() {
 Commands / 子命令:
   xteam status                       查看所有会话+锁+聊天 / show all sessions, locks & chat
   xteam statusline                   单行简报(底部状态栏用) / one-line summary (status bar)
-  xteam stopctx                      输出 Stop hook 简报 JSON / JSON briefing for the Stop hook
   xteam rehook                       重写 settings.json 的 hook/statusLine / re-write hooks + statusLine
   xteam check <path>                 路径是否被占用 / is the path locked?
   xteam acquire <path> [--note N] [--owner O] [--label L]   加锁(含子目录) / lock file or dir (+subtree)
@@ -734,9 +703,8 @@ Wait / 等锁:      轮询 ${WAIT_POLL}s (XTEAM_WAIT_POLL)，上限 ${WAIT_MAX}s
 默认已启用 / enabled by default:
   · 会话启动 SessionStart 自动跑 \`xteam status\`。
   · 底部状态栏 statusLine 每轮回复后刷新一行简报 (xteam statusline)。
-  · 每轮结束 Stop hook 注入下一轮简报 (xteam stopctx)。
 Default: SessionStart auto-runs \`xteam status\`; the statusLine refreshes a one-line
-summary after every reply; the Stop hook injects a fresh briefing for the next turn.`);
+summary after every reply.`);
 }
 
 async function main() {
@@ -763,7 +731,6 @@ async function main() {
     case 'status': return status();
     case 'statusline':
     case 'line': return statusline();
-    case 'stopctx': return stopContext();
     case 'rehook': return refreshHooks();
     case 'label': return setLabel(pos.join(' '));
     case 'say':
