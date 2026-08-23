@@ -220,11 +220,12 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 | `xteam check <path>` | 该路径是否被占用 is the path locked? |
 | `xteam acquire <path> --note "..."` | 加锁（目录锁覆盖子树）lock (dir locks cover subtree) |
 | `xteam release <path>` | 放锁（自动 @ 通知等待者）release (+ auto @-notify waiters) |
+| `xteam release --all` | 放掉本会话所有锁（收尾必做）release ALL your locks |
 | `xteam wait <path>` | 排队等锁，一放开自动接手 queue up; auto-acquire on release |
 | `xteam say "..."` | 发到群聊 post to group chat |
 | `xteam tail [N]` | 最近 N 条聊天 last N chat lines |
 | `xteam heartbeat <path>` | 续期（长任务防误判 stale）refresh a lock |
-| `xteam takeover <path>` | 接管过期锁 clear & re-acquire a stale lock |
+| `xteam takeover <path>` | 接管**无主锁**（持有者会话已消失）take over an ORPHANED lock |
 | `xteam label "..."` | 给会话起名（显示 `<id>-名字`）name this session |
 | `xteam update` | 更新到最新 GitHub 版本 update to latest release |
 | `xteam version` | 版本号 show version |
@@ -237,6 +238,10 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 3. **说 say** `xteam say "锁了 <path>，在做什么，预计多久"` *post progress*
 4. **改 edit** 正常编辑 / 派 Codex *edit or delegate to Codex*
 5. **放 release** `xteam release <path>` *release when done — waiters get @-notified automatically*
+6. **收尾 release --all** `xteam release --all` *release everything before you finish — nobody does it for you after the session exits*
+
+> **锁不会因为「很久没动」就能抢。** 判据是**持有者会话是否还活着**——派 Codex 跑半小时，锁看起来就是「很久没动」。`check`/`status` 会区分 `owner is ALIVE`（别抢，去排队）、`会话已退出`（等到期）、`ORPHANED/无主`（可接管）；`takeover` 会自己拦住前两种。你自己的锁在每次 `status`/`check` 时**自动续期**。
+> *A lock is takeable only when its OWNER SESSION is gone (`ORPHANED`) — never merely because it looks idle. Your own locks auto-renew on every `status`/`check`.*
 
 ### 等锁 Waiting（别干等，也别硬改）
 

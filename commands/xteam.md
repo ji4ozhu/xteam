@@ -17,10 +17,12 @@ node ~/.claude/skills/xteam/xteam.mjs help
 3. `xteam say "锁了 <path>, 在做什么"` to post progress
 4. Edit / delegate to Codex.
 5. `xteam release <path>` when done — automatically @-notifies everyone waiting on it.
+6. `xteam release --all` before you finish the turn — nobody releases your locks after the session exits.
 
 - Lock whole directories when touching a module (covers subtree).
-- `HELD … (STALE)` → `xteam takeover <path> --owner <name>`.
-- Holder unresponsive but not yet stale? Background `xteam wait` — it returns the moment they release, or tells you to `takeover` if they go stale. Don't force the edit.
+- **A lock is takeable only when the OWNER SESSION is gone** (`ORPHANED`), never merely because the lock looks idle — a long Codex write looks exactly like an idle lock. `takeover` refuses while the owner is alive.
+- `ORPHANED/无主` → `xteam takeover <path>`. `owner is ALIVE` → don't touch it; background `xteam wait`, or ask via `xteam say`.
+- Your own locks auto-renew on every `status`/`check` — no manual `heartbeat` needed.
 - Owner is auto-detected from the session; pass `--owner A` only for a readable name.
 - After launching a background `wait`, **report in plain text before ending your turn** — never leave the raw `Command running in background with ID: …` as the user-facing status:
 

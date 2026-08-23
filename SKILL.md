@@ -1,6 +1,6 @@
 ---
 name: xteam
-description: Coordinate file edits and share a group chat across concurrent Claude Code sessions (and Codex delegates) in the same repo. Use BEFORE editing any file or delegating edits to Codex — run `xteam check <path>`, then `xteam acquire <path>`, post progress with `xteam say "<msg>"`, and `xteam release <path>` when done. If a path is already locked, run `xteam wait <path>` in the BACKGROUND (run_in_background=true) and end your turn — it auto-acquires the moment the holder releases and you get woken up. Trigger automatically in EVERY session (no config needed), whenever multiple sessions work in parallel, or when delegating edits to Codex.
+description: Coordinate file edits and share a group chat across concurrent Claude Code sessions (and Codex delegates) in the same repo. Use BEFORE editing any file or delegating edits to Codex — run `xteam check <path>`, then `xteam acquire <path>`, post progress with `xteam say "<msg>"`, and `xteam release <path>` when done (plus `xteam release --all` before you finish). A lock is only takeable when its OWNER SESSION is gone (ORPHANED) — never merely because the lock looks idle. If a path is already locked, run `xteam wait <path>` in the BACKGROUND (run_in_background=true) and end your turn — it auto-acquires the moment the holder releases and you get woken up. Trigger automatically in EVERY session (no config needed), whenever multiple sessions work in parallel, or when delegating edits to Codex.
 ---
 
 # xteam — 跨会话协作（锁 + 群聊）/ cross-session coordination (locks + group chat)
@@ -15,7 +15,7 @@ Coordinates which parallel conversation edits which file first, and shares a gro
 node ~/.claude/skills/xteam/xteam.mjs <子命令/subcommand> [参数/args]
 ```
 
-子命令：`status` · `check` · `acquire` · `release` · `wait` · `heartbeat` · `takeover` · `label` · `say` · `tail` · `update` · `version` · `help`
+子命令：`status` · `check` · `acquire` · `release` · `release --all` · `wait` · `heartbeat` · `takeover` · `label` · `say` · `tail` · `update` · `version` · `help`
 
 ## 铁律 / Protocol（改任何文件 / 派 Codex 之前必须遵守）
 
@@ -25,6 +25,23 @@ node ~/.claude/skills/xteam/xteam.mjs <子命令/subcommand> [参数/args]
 3. **说 / say**：`xteam say "锁了 <path>，<在做什么>，预计 <多久>"` —— 让别的对话在群里看到。
 4. **改 / edit**：正常编辑 / 派 Codex。
 5. **放 / release**：改完验证完 → `xteam release <path>`。会自动 @ 通知所有在等这把锁的会话，不用再手动喊。
+6. **收尾 / release --all**：**这一轮活干完、或你要结束回合之前，跑一次 `xteam release --all`**，把本会话所有锁一次性放掉。会话退出后没人替你放锁，别人只能干等到超时。
+
+## 锁的状态怎么读 / Reading lock state（别抢正在干活的人）
+
+锁**不会**因为"很久没动"就能抢。判断依据是**持有者会话是否还活着**（presence 心跳），不是锁本身的空闲时长——长时间落盘（比如派 Codex 跑半小时）看起来就是"锁很久没动"。
+
+`check` / `status` 会明确告诉你是哪一种：
+
+| 显示 | 含义 | 你该做什么 |
+|---|---|---|
+| `owner is ALIVE` / 持有者仍在线 | 会话活着，可能正在长时间落盘 | **绝不能 takeover**。后台 `xteam wait`，或 `xteam say` 问一句 |
+| `会话已退出/session gone` | 会话没了，但锁还没到期 | 后台 `xteam wait`，到期会自动提示你接管 |
+| `ORPHANED/无主` | 会话已消失且锁已过期 | 可安全 `xteam takeover <path>` |
+
+`takeover` 会自己拦住前两种，抢不动。**看到「很久没动」就断定对方挂了，是错的**——只有 `ORPHANED` 才代表无主。
+
+你自己持有的锁会在每次 `status`/`check` 时**自动续期**，不必手动 `heartbeat`；只要你还在正常干活，锁就不会被判成无主。
 
 ## 等锁 / Waiting（别干等，也别硬改）
 
@@ -32,7 +49,7 @@ node ~/.claude/skills/xteam/xteam.mjs <子命令/subcommand> [参数/args]
 
 - 自动在群聊 @ 持有者说明你在等什么，**并登记到等待队列**（对方 `xteam status` / `xteam check` 都能看到「谁在等」）；
 - 轮询等待（默认每 5s，上限 900s），对方一 `release`，**你立刻自动拿到锁**，无需再手动 acquire；
-- 如果持有者已经**失联过期**（idle > TTL），会直接提示你 `xteam takeover <path>` 接管，不会无限等下去；
+- 如果持有者**会话已消失**（判据是 presence 心跳没了，不是"锁很久没动"），会提示你 `xteam takeover <path>` 接管，不会无限等下去；
 - 超时也不丢：等待登记保留，再跑一次 `xteam wait` 即可。
 
 ### 必须用后台跑 / MUST run it in the background

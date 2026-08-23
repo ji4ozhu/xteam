@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const REPO_RAW = 'https://raw.githubusercontent.com/ji4ozhu/xteam/main';
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));   // ~/.claude/skills/xteam
 const SKILL_DIR = SELF_DIR;
@@ -134,24 +134,30 @@ function registerPresence() {
   if (!m.label && process.env.XTEAM_LABEL) m.label = process.env.XTEAM_LABEL;
   m.lastSeenAt = t;
   writeMetaAtomic(key, m);
+  renewOwnLocks();
   return who;
 }
 
 function report(p, key, via) {
   const m = readMeta(key);
   const who = m && m.owner ? m.owner : '?';
-  const hb = m && m.heartbeatAt ? m.heartbeatAt : 0;
-  const idle = nowSec() - hb;
-  const stale = idle > TTL ? ' (STALE)' : '';
+  const st = m ? lockState(m) : { tag: 'orphaned', idle: 0, alive: false };
   const viaStr = via && via !== p ? ` [via ${via}]` : '';
   const note = m && m.note ? ` — ${m.note}` : '';
-  console.log(`HELD: ${p}${viaStr} — owner=${displayName(who)}, idle=${idle}s${stale}${note}`);
+  const tag = st.tag === 'orphaned' ? ' (ORPHANED/无主)' : st.alive ? '' : ' (会话已退出/session gone)';
+  console.log(`HELD: ${p}${viaStr} — owner=${displayName(who)}, idle=${st.idle}s${tag}${note}`);
   const queue = listWaiters(p);
   if (queue.length) {
     console.log(`  队列/waiting: ${queue.map((w) => displayName(w.owner)).join(', ')}`);
   }
-  if (idle > TTL) console.log(`  已过期，可 xteam takeover ${p} 接管 / stale, run xteam takeover ${p}`);
-  else console.log(`  别硬改。xteam wait ${p} 会等到放锁并自动接手 / don't edit anyway; xteam wait ${p} blocks until free, then auto-acquires`);
+  if (st.tag === 'orphaned') {
+    console.log(`  持有者会话已消失，可安全接管 / owner session is gone — safe to take over:`);
+    console.log(`    xteam takeover ${p}`);
+  } else if (st.alive) {
+    console.log(`  持有者仍在线（可能正在长时间落盘）。别抢 —— 后台 xteam wait ${p} 排队 / owner is ALIVE (maybe a long write). Don't take it; queue with xteam wait.`);
+  } else {
+    console.log(`  持有者会话已退出但锁未过期，${fmtIdle(TTL - st.idle)} 后可接管；或后台 xteam wait ${p} 自动接手 / session gone; takeover in ${fmtIdle(TTL - st.idle)}, or queue with xteam wait.`);
+  }
 }
 
 function findHeld(p) {
@@ -232,6 +238,21 @@ function release(p) {
   }
 }
 
+function releaseAll() {
+  const me = owner();
+  const mine = [];
+  for (const d of fs.existsSync(LOCKS) ? fs.readdirSync(LOCKS) : []) {
+    const m = readMeta(path.join(LOCKS, d));
+    if (m && m.owner === me) mine.push(m.path);
+  }
+  if (!mine.length) {
+    console.log('NOT HELD: 本会话没有持有任何锁 / you hold no locks.');
+    return;
+  }
+  for (const p of mine) release(p);
+  console.log(`RELEASED ALL: ${mine.length} 个锁已放 / released ${mine.length} lock(s).`);
+}
+
 function heartbeat(p) {
   p = normalize(p);
   const key = lockDir(p);
@@ -302,11 +323,11 @@ function wait(p, opts) {
       return acquire(p, opts);
     }
     const cm = readMeta(cur.key);
-    const idle = nowSec() - ((cm && cm.heartbeatAt) || 0);
-    if (idle > TTL) {
+    const st = cm ? lockState(cm) : { tag: 'orphaned', idle: 0, alive: false };
+    if (st.tag === 'orphaned') {
       dropWaiter(p, me);
-      console.log(`STALE: ${p} — 持有者 ${displayName((cm && cm.owner) || '?')} 已过期 (idle=${idle}s) / holder went stale`);
-      console.log(`  用 xteam takeover ${p} 接管 / run xteam takeover ${p} to take it over`);
+      console.log(`ORPHANED: ${p} — 持有者 ${displayName((cm && cm.owner) || '?')} 的会话已消失 (idle=${st.idle}s) / owner session is gone`);
+      console.log(`  可安全接管：xteam takeover ${p} / safe to take over`);
       return;
     }
     addWaiter(p, me, opts.note);   // keep our waiter entry fresh
@@ -323,14 +344,22 @@ function takeover(p, opts) {
   const key = lockDir(p);
   const m = readMeta(key);
   if (m) {
-    const idle = nowSec() - (m.heartbeatAt || 0);
-    if (idle <= TTL) {
+    const st = lockState(m);
+    if (st.alive) {
       report(p, key);
-      console.log(`takeover refused: lock still active (idle=${idle}s). Release it or wait for it to go stale.`);
+      console.log(`takeover 拒绝：持有者会话仍在线（idle=${st.idle}s）。长时间落盘也会这样——别抢。`);
+      console.log(`takeover refused: owner session is still ALIVE. A long write looks like this too — don't steal it.`);
+      console.log(`  先 xteam say 问一句，或后台 xteam wait ${p} 排队 / ask via xteam say, or queue with xteam wait.`);
+      return;
+    }
+    if (st.tag !== 'orphaned') {
+      report(p, key);
+      console.log(`takeover 拒绝：持有者会话已退出，但锁还有 ${fmtIdle(TTL - st.idle)} 才过期 / owner gone but lock not expired yet.`);
+      console.log(`  后台 xteam wait ${p} 会在到期后自动提示接管 / background xteam wait will tell you when it's takeable.`);
       return;
     }
     fs.rmSync(key, { recursive: true, force: true });
-    console.log(`takeover: cleared stale lock on ${p}  / 已清除过期锁`);
+    console.log(`takeover: 持有者会话已消失，清除无主锁 ${p} / cleared orphaned lock (owner session gone)`);
   }
   acquire(p, opts);
 }
@@ -347,6 +376,41 @@ function listPresence() {
   return fs.readdirSync(PRESENCE)
     .map((d) => readMeta(path.join(PRESENCE, d)))
     .filter(Boolean);
+}
+
+// Is the session that owns a lock still alive? Presence heartbeats on every
+// status/check, so a live session keeps proving itself even while its lock
+// sits untouched. Without this, a long edit looks identical to a dead session.
+function ownerAlive(who) {
+  const m = readMeta(presenceDir(who));
+  if (!m) return false;
+  return nowSec() - (m.lastSeenAt || 0) <= TTL;
+}
+
+// A lock is only safe to take over when its OWNER is gone — not merely when
+// the lock itself has sat still. Long work must not look like death.
+function lockState(m) {
+  const idle = nowSec() - (m.heartbeatAt || 0);
+  if (ownerAlive(m.owner)) return { tag: 'held', idle, alive: true };
+  if (idle > TTL) return { tag: 'orphaned', idle, alive: false };
+  return { tag: 'held', idle, alive: false };
+}
+
+// Renew every lock this session holds. Called from status/check, so simply
+// working the protocol keeps your locks alive — no discipline required.
+function renewOwnLocks() {
+  const me = owner();
+  const t = nowSec();
+  let n = 0;
+  for (const d of fs.existsSync(LOCKS) ? fs.readdirSync(LOCKS) : []) {
+    const key = path.join(LOCKS, d);
+    const m = readMeta(key);
+    if (!m || m.owner !== me) continue;
+    m.heartbeatAt = t;
+    writeMetaAtomic(key, m);
+    n++;
+  }
+  return n;
 }
 
 function chatTail(n) {
@@ -387,11 +451,17 @@ function status() {
     const heldStr = held.length ? held.join(', ') : '-';
     console.log(`  [session] ${displayName(o)}${isMe ? ' [you/你]' : ''}  idle ${fmtIdle(idle)}  holding/占用: ${heldStr}`);
   }
+  const orphans = [];
   for (const m of locks) {
     if (active.some((p) => p.owner === m.owner)) continue; // already shown under its session
-    const idle = now - (m.heartbeatAt || 0);
-    const stale = idle > TTL ? ' (STALE)' : '';
-    console.log(`  [lock] ${m.path}  owner=${displayName(m.owner)}  idle=${fmtIdle(idle)}${stale}${m.note ? ` (${m.note})` : ''}`);
+    const st = lockState(m);
+    if (st.tag === 'orphaned') orphans.push(m.path);
+    const tag = st.tag === 'orphaned' ? ' (ORPHANED/无主，可接管)' : ' (会话已退出/session gone)';
+    console.log(`  [lock] ${m.path}  owner=${displayName(m.owner)}  idle=${fmtIdle(st.idle)}${tag}${m.note ? ` (${m.note})` : ''}`);
+  }
+  if (orphans.length) {
+    console.log(`  -> ${orphans.length} 个无主锁（持有者会话已消失），可 xteam takeover 接管 / orphaned, safe to take over:`);
+    for (const p of orphans) console.log(`     xteam takeover ${p}`);
   }
   for (const l of chat) console.log(`  [xteam#chat] ${l}`);
 
@@ -543,6 +613,7 @@ Commands / 子命令:
   xteam check <path>                 路径是否被占用 / is the path locked?
   xteam acquire <path> [--note N] [--owner O] [--label L]   加锁(含子目录) / lock file or dir (+subtree)
   xteam release <path>               放锁(并 @ 通知等待者) / release (+ notify waiters)
+  xteam release --all                放掉本会话所有锁(收尾必做) / release ALL your locks (do this before you finish)
   xteam wait <path> [--note N]       阻塞等锁，一放开自动接手 / block until free, then auto-acquire
   xteam heartbeat <path>             续期 / refresh a lock
   xteam takeover <path>              接管过期锁 / clear & re-acquire a stale lock
@@ -567,18 +638,19 @@ async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const rest = argv.slice(1);
-  const opts = { owner: null, note: null, label: null };
+  const opts = { owner: null, note: null, label: null, all: false };
   const pos = [];
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--owner' && rest[i + 1]) { opts.owner = rest[i + 1]; i++; }
     else if (rest[i] === '--note' && rest[i + 1]) { opts.note = rest[i + 1]; i++; }
     else if (rest[i] === '--label' && rest[i + 1]) { opts.label = rest[i + 1]; i++; }
+    else if (rest[i] === '--all') { opts.all = true; }
     else pos.push(rest[i]);
   }
   switch (cmd) {
     case 'check': return check(pos[0] || '');
     case 'acquire': return acquire(pos[0] || '', opts);
-    case 'release': return release(pos[0] || '');
+    case 'release': return opts.all ? releaseAll() : release(pos[0] || '');
     case 'wait': return wait(pos[0] || '', opts);
     case 'heartbeat': return heartbeat(pos[0] || '');
     case 'takeover': return takeover(pos[0] || '', opts);
