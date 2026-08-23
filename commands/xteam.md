@@ -24,6 +24,7 @@ node ~/.claude/skills/xteam/xteam.mjs help
 - `ORPHANED/无主` → `xteam takeover <path>`. `owner is ALIVE` → don't touch it; background `xteam wait`, or ask via `xteam say`.
 - Your own locks auto-renew on every `status`/`check` — no manual `heartbeat` needed.
 - Owner is auto-detected from the session; pass `--owner A` only for a readable name.
+- The bottom status line auto-refreshes a one-line briefing after every reply; the Stop hook injects a fresh briefing for the next turn. Both auto-installed — no manual step.
 - After launching a background `wait`, **report in plain text before ending your turn** — never leave the raw `Command running in background with ID: …` as the user-facing status:
 
   ```

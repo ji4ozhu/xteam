@@ -15,7 +15,7 @@ Coordinates which parallel conversation edits which file first, and shares a gro
 node ~/.claude/skills/xteam/xteam.mjs <子命令/subcommand> [参数/args]
 ```
 
-子命令：`status` · `check` · `acquire` · `release` · `release --all` · `wait` · `heartbeat` · `takeover` · `label` · `say` · `tail` · `update` · `version` · `help`
+子命令：`status` · `check` · `acquire` · `release` · `release --all` · `wait` · `heartbeat` · `takeover` · `label` · `say` · `tail` · `update` · `version` · `help`（另有 `statusline` / `stopctx` 供 hook 自动调用）
 
 ## 铁律 / Protocol（改任何文件 / 派 Codex 之前必须遵守）
 
@@ -98,6 +98,15 @@ Xteam: actor.rs 等待超时，持有者 e193b67b 仍活跃（idle 3m）。
 
 **别做的事**：不要因为对方"迟迟不回应"就硬改被锁的文件。要么后台 `wait`，要么等它过期后 `takeover`——两条路都会留下痕迹，改动始终可归属。
 
+## 结尾自动简报 / Auto briefing（每轮自动刷新）
+
+除了会话启动时跑一次 `xteam status`，安装时还自动配了两个「每轮结束」机制，让人和 AI 都随时知道现场：
+
+- **底部状态栏 statusLine**：每次 AI 回复后自动刷新**一行**紧凑简报（内部跑 `xteam statusline`，形如 `xteam 5会话·0锁·聊0 | 我无锁 | 4会话在跑`）。始终可见，扫一眼就知道几个会话在跑、自己锁没锁、有没有无主锁。
+- **每轮结束 Stop hook**：Claude 每轮回复结束时，自动把一份最新简报注入**下一轮**上下文（内部跑 `xteam stopctx`），让模型始终知道谁锁了什么、群里说了啥——不用你手动贴。
+
+两者都写入 `~/.claude/settings.json`（`statusLine` 设置 + `Stop` hook），`xteam install` 或 `xteam update` 会自动刷新。新开对话即刻生效。
+
 ## 共享感知 / Shared awareness（看到别人在干嘛 / see what others are doing）
 
 会话启动时 SessionStart 已经自动跑过 `xteam status`，你能看到**其他会话的名字 + 在改什么 + 最近说了什么**。别当摆设：
@@ -111,7 +120,7 @@ Xteam: actor.rs 等待超时，持有者 e193b67b 仍活跃（idle 3m）。
 
 ## 关键规则 / Key rules
 
-- **默认启用，零配置 / enabled by default, zero config**：会话启动时 SessionStart hook 自动跑 `xteam status`，输出当前所有会话状态。无需手动输入 `/xteam`。
+- **默认启用，零配置 / enabled by default, zero config**：会话启动时 SessionStart hook 自动跑 `xteam status` 输出当前所有会话状态；底部状态栏每轮回复后刷新一行简报；每轮结束 Stop hook 把最新简报注入下一轮。无需手动输入 `/xteam`。
 - **身份自动识别 / auto identity**：脚本默认用当前会话的 `CLAUDE_CODE_SESSION_ID` 前 8 位作为 owner，每个对话自动唯一、跨调用稳定。想看可读名才传 `--owner A`。
 - **锁目录优先 / prefer dir locks**：动一个模块就锁整个目录，别逐文件，省心且不漏。
 - **冲突自动提示 / auto conflict warning**：已配 PreToolUse hook——你要改的文件若被别的会话占用，编辑前会自动弹出 `[xteam] 冲突` 警告。看到就停手，改别的文件或去协调。

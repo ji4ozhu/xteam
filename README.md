@@ -45,6 +45,7 @@ After installing it, you don't need to do anything — it automatically activate
 | 💬 **群聊 Group chat** | 所有会话共享一个 `chat.log`，互通「我在改什么、还差多久」。All sessions share one `chat.log` — "what I'm editing, how long I'll be". |
 | 👥 **在线状态 Presence** | 每个会话自动登记 presence，一眼看到「谁在、正在改什么」。Every session auto-registers; see who's online and what they hold. |
 | ⚡ **默认启用·零配置 Zero config** | SessionStart hook 自动跑 `status`，新开对话即可用，无需手动输入。A SessionStart hook auto-runs `status` — works in every new session. |
+| 🧭 **结尾自动简报 Auto briefing** | 底部状态栏每轮回复后刷新一行简报；每轮结束 Stop hook 把最新简报注入下一轮。A statusLine refreshes a one-line summary after every reply; a Stop hook injects a fresh briefing for the next turn. |
 | 🚨 **冲突自动警告 Conflict warning** | 编辑被他人占用的文件前，PreToolUse hook 自动弹 `[xteam] 冲突`。Warns before you edit a file someone else holds. |
 | 🤝 **Codex/GPT 协作 Codex/GPT collab** | 先锁路径再派 Codex，Claude 指挥、Codex 落盘。Lock paths first, then delegate — Claude directs, Codex writes. |
 | 🌍 **跨平台 Cross-platform** | Windows / macOS / Linux，纯 Node 内置模块，零第三方依赖。Pure Node builtins, zero deps. |
@@ -127,7 +128,15 @@ cp commands/xteam.md ~/.claude/commands/
     "PreToolUse": [
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [ { "type": "command", "command": "node \"<你的home>/.claude/skills/xteam/xteam.mjs\" preedit" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "node \"<你的home>/.claude/skills/xteam/xteam.mjs\" stopctx" } ] }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node \"<你的home>/.claude/skills/xteam/xteam.mjs\" statusline",
+    "padding": 0
   }
 }
 ```
@@ -162,6 +171,8 @@ xteam: 2 session(s) · 1 lock(s) · chat 3  (2 会话 · 1 锁 · 聊天 3)
   [session] e5f6a7b8-改支付功能         idle 3m  holding/占用: -
   [xteam#chat] [08-23 00:40] fdf64f36-改Auth功能: 锁了 src/auth，改登录，预计 20 分钟
 ```
+
+另外，**底部状态栏**每轮回复后会自动刷新一行紧凑简报（`xteam 5会话·0锁·聊0 | 我无锁`），**每轮结束 Stop hook** 把最新简报注入下一轮，让 AI 全程知道现场。*Also: the bottom status line auto-refreshes a one-line summary after every reply, and the Stop hook injects a fresh briefing each turn so the AI always knows the current state.*
 
 ### 🎬 效果演示 Demo
 
@@ -217,6 +228,8 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 |---|---|
 | `/xteam` | 查看帮助（中英双语）show bilingual help |
 | `xteam status` | 所有会话 + 锁 + 群聊 all sessions, locks & chat |
+| `xteam statusline` | 单行简报（底部状态栏自动调用）one-line summary (auto: status bar) |
+| `xteam stopctx` | Stop hook 简报 JSON（自动调用）JSON briefing (auto: Stop hook) |
 | `xteam check <path>` | 该路径是否被占用 is the path locked? |
 | `xteam acquire <path> --note "..."` | 加锁（目录锁覆盖子树）lock (dir locks cover subtree) |
 | `xteam release <path>` | 放锁（自动 @ 通知等待者）release (+ auto @-notify waiters) |

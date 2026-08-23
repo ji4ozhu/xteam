@@ -1,6 +1,6 @@
 {
   "name": "xteam",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Cross-session file coordination + group chat for Claude Code & Codex — locks, presence, shared chat. Zero config, cross-platform.",
   "license": "MIT",
   "bin": {

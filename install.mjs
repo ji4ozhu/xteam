@@ -36,6 +36,8 @@ const GITIGNORE = path.join(HOME, '.gitignore_global');
 
 const HOOK_STATUS = `node "${scriptFwd}" status`;
 const HOOK_PREEDIT = `node "${scriptFwd}" preedit`;
+const HOOK_STATUSLINE = `node "${scriptFwd}" statusline`;
+const HOOK_STOP = `node "${scriptFwd}" stopctx`;
 const MATCHER = 'Edit|Write|MultiEdit|NotebookEdit';
 
 function ok(m) { console.log(`  ✔ ${m}`); }
@@ -103,8 +105,10 @@ function mergeHooks() {
     matcher: MATCHER,
     hooks: [{ type: 'command', command: HOOK_PREEDIT }],
   });
+  ensureHook(settings, 'Stop', { hooks: [{ type: 'command', command: HOOK_STOP }] });
+  settings.statusLine = { type: 'command', command: HOOK_STATUSLINE, padding: 0 };
   fs.writeFileSync(SETTINGS, JSON.stringify(settings, null, 2) + '\n');
-  ok(`已写入 hook 到 ${home(SETTINGS)}`);
+  ok(`已写入 hook + statusLine 到 ${home(SETTINGS)}`);
 }
 
 function setupGitignore() {
