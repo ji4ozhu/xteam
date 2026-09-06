@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.3.1';
+const VERSION = '1.3.2';
 const REPO_RAW = 'https://raw.githubusercontent.com/ji4ozhu/xteam/main';
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));   // ~/.claude/skills/xteam
 const SKILL_DIR = SELF_DIR;
@@ -581,50 +581,95 @@ function showVersion() {
   console.log(`xteam v${VERSION}`);
 }
 
-// Re-write the settings.json hooks + statusLine (mirrors install.mjs). Called by
-// `update` on every run so existing installs self-heal new hooks without a full
-// reinstall. Uses forward-slash paths so the command strings are shell-safe.
-function refreshHooks() {
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+function isXteamHook(h) {
+  return String((h && h.command) || '').includes('xteam.mjs');
+}
+
+// Remove every xteam hook + xteam statusLine from a parsed settings object
+// (across all events). Returns true if anything changed.
+function removeXteam(settings) {
+  let changed = false;
+  if (settings.hooks) {
+    for (const event of Object.keys(settings.hooks)) {
+      const groups = settings.hooks[event];
+      if (!Array.isArray(groups)) continue;
+      const kept = groups
+        .map((g) => {
+          if (!g || !Array.isArray(g.hooks)) return g;
+          const hooks = g.hooks.filter((h) => !isXteamHook(h));
+          if (hooks.length !== g.hooks.length) changed = true;
+          return { ...g, hooks };
+        })
+        .filter((g) => g && g.hooks && g.hooks.length);
+      if (kept.length) settings.hooks[event] = kept;
+      else { delete settings.hooks[event]; changed = true; }
+    }
+    if (Object.keys(settings.hooks).length === 0) { delete settings.hooks; changed = true; }
+  }
+  if (settings.statusLine && isXteamHook(settings.statusLine)) { delete settings.statusLine; changed = true; }
+  return changed;
+}
+
+// Re-write the hooks + statusLine (mirrors install.mjs). Called by `update` on
+// every run so existing installs self-heal new hooks without a full reinstall.
+// Uses forward-slash paths so the command strings are shell-safe.
+// With `local` (or XTEAM_SETTINGS_LOCAL=1) it writes to settings.local.json
+// instead of settings.json — for config managers (e.g. cc-switch) that rewrite
+// settings.json on every provider switch, clobbering the hooks.
+function refreshHooks(local) {
+  local = !!local || ['1', 'true'].includes(process.env.XTEAM_SETTINGS_LOCAL);
+  const dir = path.join(os.homedir(), '.claude');
+  const target = path.join(dir, local ? 'settings.local.json' : 'settings.json');
+  const other = path.join(dir, local ? 'settings.json' : 'settings.local.json');
   const scriptFwd = path.join(SKILL_DIR, 'xteam.mjs').replace(/\\/g, '/');
-  let settings = {};
-  if (fs.existsSync(settingsPath)) {
+  // Absolute path to the node binary running this script, so the hook fires even
+  // when `node` isn't on PATH in the hook's shell (e.g. Homebrew on macOS).
+  const nodeCmd = process.execPath.replace(/\\/g, '/');
+
+  // Strip any xteam hooks from the *other* file so exactly one copy survives.
+  if (fs.existsSync(other)) {
     try {
-      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      const otherSettings = JSON.parse(fs.readFileSync(other, 'utf8'));
+      if (removeXteam(otherSettings)) {
+        fs.writeFileSync(other, JSON.stringify(otherSettings, null, 2) + '\n');
+        console.log(`  ✔ 已从 ${other} 移除旧的 xteam hook`);
+      }
     } catch (e) {
-      console.log(`  ⚠ 无法解析 settings.json: ${e.message}，跳过 hook 刷新`);
+      console.log(`  ⚠ 无法解析 ${other}: ${e.message}，跳过清理`);
+    }
+  }
+
+  let settings = {};
+  if (fs.existsSync(target)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(target, 'utf8'));
+    } catch (e) {
+      console.log(`  ⚠ 无法解析 ${target}: ${e.message}，跳过 hook 刷新`);
       return;
     }
   }
+  removeXteam(settings);   // self-heal any leftover xteam hooks in the target
   const ensure = (event, entry) => {
     settings.hooks = settings.hooks || {};
     settings.hooks[event] = settings.hooks[event] || [];
     settings.hooks[event] = settings.hooks[event].filter(
-      (g) => !(g.hooks || []).some((h) => String(h.command || '').includes('xteam.mjs'))
+      (g) => !(g.hooks || []).some((h) => isXteamHook(h))
     );
     settings.hooks[event].push(entry);
   };
-  ensure('SessionStart', { hooks: [{ type: 'command', command: `node "${scriptFwd}" status` }] });
+  ensure('SessionStart', { hooks: [{ type: 'command', command: `"${nodeCmd}" "${scriptFwd}" status` }] });
   ensure('PreToolUse', {
     matcher: 'Edit|Write|MultiEdit|NotebookEdit',
-    hooks: [{ type: 'command', command: `node "${scriptFwd}" preedit` }],
+    hooks: [{ type: 'command', command: `"${nodeCmd}" "${scriptFwd}" preedit` }],
   });
-  // v1.3.1: the Stop hook (additionalContext) caused an auto-reinvoke loop in
-  // some backends — remove any leftover xteam Stop hook so old installs heal.
-  if (settings.hooks && settings.hooks.Stop) {
-    settings.hooks.Stop = settings.hooks.Stop.filter(
-      (g) => !(g.hooks || []).some((h) => String(h.command || '').includes('xteam.mjs'))
-    );
-    if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
-  }
-  settings.statusLine = { type: 'command', command: `node "${scriptFwd}" statusline`, padding: 0 };
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
-  console.log('  ✔ 已刷新 hook + statusLine');
+  settings.statusLine = { type: 'command', command: `"${nodeCmd}" "${scriptFwd}" statusline`, padding: 0 };
+  fs.writeFileSync(target, JSON.stringify(settings, null, 2) + '\n');
+  console.log(`  ✔ 已刷新 hook + statusLine${local ? ' → settings.local.json' : ''}`);
 }
 
-async function update() {
+async function update(local) {
   console.log(`xteam: 当前 / current v${VERSION}，检查 GitHub 最新版本 / checking...`);
-  refreshHooks();
+  refreshHooks(local);
   let remoteSrc;
   let remoteVer;
   try {
@@ -679,7 +724,7 @@ function help() {
 Commands / 子命令:
   xteam status                       查看所有会话+锁+聊天 / show all sessions, locks & chat
   xteam statusline                   单行简报(底部状态栏用) / one-line summary (status bar)
-  xteam rehook                       重写 settings.json 的 hook/statusLine / re-write hooks + statusLine
+  xteam rehook [--local]             重写 hook/statusLine（--local 写 settings.local.json）/ re-write hooks + statusLine
   xteam check <path>                 路径是否被占用 / is the path locked?
   xteam acquire <path> [--note N] [--owner O] [--label L]   加锁(含子目录) / lock file or dir (+subtree)
   xteam release <path>               放锁(并 @ 通知等待者) / release (+ notify waiters)
@@ -690,7 +735,7 @@ Commands / 子命令:
   xteam label <名称>                 给本会话起名(显示为 <id>-<名称>) / name this session
   xteam say <message> [--label L]    发到群聊 / post to group chat
   xteam tail [N]                     最近 N 条聊天 / last N chat lines (default 20)
-  xteam update                       更新到最新 GitHub 版本 / update to latest GitHub release
+  xteam update [--local]             更新到最新 GitHub 版本 / update to latest GitHub release
   xteam version                      版本号 / version
   xteam help                         本帮助 / this help
 
@@ -699,6 +744,7 @@ Owner / 身份:     自动取自当前会话 (auto-detected from session); --own
 Label / 名字:     用 \`xteam label\` 或 \`--label\` 或 XTEAM_LABEL 设置，显示为 <id>-<名字>
 TTL / 过期:       ${TTL}s (XTEAM_TTL); 日志上限 ${LOG_MAX} 条 (XTEAM_LOG_MAX)
 Wait / 等锁:      轮询 ${WAIT_POLL}s (XTEAM_WAIT_POLL)，上限 ${WAIT_MAX}s (XTEAM_WAIT_MAX)
+Hook 位置 / hooks:  默认写 settings.json；--local 或 XTEAM_SETTINGS_LOCAL=1 则写 settings.local.json（防 cc-switch 等切换器冲掉）
 
 默认已启用 / enabled by default:
   · 会话启动 SessionStart 自动跑 \`xteam status\`。
@@ -711,13 +757,14 @@ async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const rest = argv.slice(1);
-  const opts = { owner: null, note: null, label: null, all: false };
+  const opts = { owner: null, note: null, label: null, all: false, local: false };
   const pos = [];
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--owner' && rest[i + 1]) { opts.owner = rest[i + 1]; i++; }
     else if (rest[i] === '--note' && rest[i + 1]) { opts.note = rest[i + 1]; i++; }
     else if (rest[i] === '--label' && rest[i + 1]) { opts.label = rest[i + 1]; i++; }
     else if (rest[i] === '--all') { opts.all = true; }
+    else if (rest[i] === '--local') { opts.local = true; }
     else pos.push(rest[i]);
   }
   switch (cmd) {
@@ -731,7 +778,7 @@ async function main() {
     case 'status': return status();
     case 'statusline':
     case 'line': return statusline();
-    case 'rehook': return refreshHooks();
+    case 'rehook': return refreshHooks(opts.local);
     case 'label': return setLabel(pos.join(' '));
     case 'say':
     case 'log':
@@ -739,7 +786,7 @@ async function main() {
     case 'tail': return tailCmd(pos[0]);
     case 'preedit': return preedit();
     case 'update':
-    case 'upgrade': return await update();
+    case 'upgrade': return await update(opts.local);
     case 'version':
     case '-v':
     case '--version': return showVersion();

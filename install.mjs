@@ -32,12 +32,22 @@ const scriptFwd = `${homeFwd}/.claude/skills/xteam/xteam.mjs`;
 const SKILL_DIR = path.join(HOME, '.claude', 'skills', 'xteam');
 const COMMAND_DIR = path.join(HOME, '.claude', 'commands');
 const SETTINGS = path.join(HOME, '.claude', 'settings.json');
+const SETTINGS_LOCAL = path.join(HOME, '.claude', 'settings.local.json');
 const GITIGNORE = path.join(HOME, '.gitignore_global');
 
-const HOOK_STATUS = `node "${scriptFwd}" status`;
-const HOOK_PREEDIT = `node "${scriptFwd}" preedit`;
-const HOOK_STATUSLINE = `node "${scriptFwd}" statusline`;
+// Absolute path to the node binary running this script, so the hook fires even
+// when `node` isn't on PATH in the hook's shell (e.g. Homebrew on macOS).
+const nodeCmd = process.execPath.replace(/\\/g, '/');
+const HOOK_STATUS = `"${nodeCmd}" "${scriptFwd}" status`;
+const HOOK_PREEDIT = `"${nodeCmd}" "${scriptFwd}" preedit`;
+const HOOK_STATUSLINE = `"${nodeCmd}" "${scriptFwd}" statusline`;
 const MATCHER = 'Edit|Write|MultiEdit|NotebookEdit';
+
+// Write hooks to settings.local.json instead of settings.json. Useful when a
+// config manager (e.g. cc-switch) rewrites settings.json on every provider
+// switch, clobbering the xteam hooks. Pass --local or set XTEAM_SETTINGS_LOCAL=1.
+const USE_LOCAL = process.argv.includes('--local')
+  || ['1', 'true'].includes(process.env.XTEAM_SETTINGS_LOCAL);
 
 function ok(m) { console.log(`  ✔ ${m}`); }
 function warn(m) { console.log(`  ⚠ ${m}`); }
@@ -79,41 +89,80 @@ function installFile(src, dst) {
   ok(`已安装 ${home(dst)}`);
 }
 
+function isXteamHook(h) {
+  return String((h && h.command) || '').includes('xteam.mjs');
+}
+
+// Remove every xteam hook + xteam statusLine from a parsed settings object
+// (across all events). Returns true if anything changed.
+function removeXteam(settings) {
+  let changed = false;
+  if (settings.hooks) {
+    for (const event of Object.keys(settings.hooks)) {
+      const groups = settings.hooks[event];
+      if (!Array.isArray(groups)) continue;
+      const kept = groups
+        .map((g) => {
+          if (!g || !Array.isArray(g.hooks)) return g;
+          const hooks = g.hooks.filter((h) => !isXteamHook(h));
+          if (hooks.length !== g.hooks.length) changed = true;
+          return { ...g, hooks };
+        })
+        .filter((g) => g && g.hooks && g.hooks.length);
+      if (kept.length) settings.hooks[event] = kept;
+      else { delete settings.hooks[event]; changed = true; }
+    }
+    if (Object.keys(settings.hooks).length === 0) { delete settings.hooks; changed = true; }
+  }
+  if (settings.statusLine && isXteamHook(settings.statusLine)) { delete settings.statusLine; changed = true; }
+  return changed;
+}
+
 // Replace any existing xteam hook (self-healing across old `~` / `${HOME}` / absolute forms)
 function ensureHook(settings, event, entry) {
   settings.hooks = settings.hooks || {};
   settings.hooks[event] = settings.hooks[event] || [];
   settings.hooks[event] = settings.hooks[event].filter(
-    (g) => !(g.hooks || []).some((h) => String(h.command || '').includes('xteam.mjs'))
+    (g) => !(g.hooks || []).some((h) => isXteamHook(h))
   );
   settings.hooks[event].push(entry);
 }
 
 function mergeHooks() {
-  let settings = {};
-  if (fs.existsSync(SETTINGS)) {
+  const target = USE_LOCAL ? SETTINGS_LOCAL : SETTINGS;
+  const other = USE_LOCAL ? SETTINGS : SETTINGS_LOCAL;
+
+  // Strip any xteam hooks from the *other* file so exactly one copy survives.
+  if (fs.existsSync(other)) {
     try {
-      settings = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
+      const otherSettings = JSON.parse(fs.readFileSync(other, 'utf8'));
+      if (removeXteam(otherSettings)) {
+        fs.writeFileSync(other, JSON.stringify(otherSettings, null, 2) + '\n');
+        ok(`已从 ${home(other)} 移除旧的 xteam hook`);
+      }
     } catch (e) {
-      warn(`无法解析 ${home(SETTINGS)}: ${e.message}，跳过 hook 配置`);
+      warn(`无法解析 ${home(other)}: ${e.message}，跳过清理`);
+    }
+  }
+
+  let settings = {};
+  if (fs.existsSync(target)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(target, 'utf8'));
+    } catch (e) {
+      warn(`无法解析 ${home(target)}: ${e.message}，跳过 hook 配置`);
       return;
     }
   }
+  removeXteam(settings);   // self-heal any leftover xteam hooks in the target
   ensureHook(settings, 'SessionStart', { hooks: [{ type: 'command', command: HOOK_STATUS }] });
   ensureHook(settings, 'PreToolUse', {
     matcher: MATCHER,
     hooks: [{ type: 'command', command: HOOK_PREEDIT }],
   });
-  // v1.3.1: remove any leftover xteam Stop hook (it caused an auto-reinvoke loop).
-  if (settings.hooks && settings.hooks.Stop) {
-    settings.hooks.Stop = settings.hooks.Stop.filter(
-      (g) => !(g.hooks || []).some((h) => String(h.command || '').includes('xteam.mjs'))
-    );
-    if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
-  }
   settings.statusLine = { type: 'command', command: HOOK_STATUSLINE, padding: 0 };
-  fs.writeFileSync(SETTINGS, JSON.stringify(settings, null, 2) + '\n');
-  ok(`已写入 hook + statusLine 到 ${home(SETTINGS)}`);
+  fs.writeFileSync(target, JSON.stringify(settings, null, 2) + '\n');
+  ok(`已写入 hook + statusLine 到 ${home(target)}${USE_LOCAL ? ' (settings.local.json)' : ''}`);
 }
 
 function setupGitignore() {

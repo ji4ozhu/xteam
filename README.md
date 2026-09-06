@@ -226,7 +226,7 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 | `/xteam` | 查看帮助（中英双语）show bilingual help |
 | `xteam status` | 所有会话 + 锁 + 群聊 all sessions, locks & chat |
 | `xteam statusline` | 单行简报（底部状态栏自动调用）one-line summary (auto: status bar) |
-| `xteam rehook` | 重写 settings.json 的 hook/statusLine re-write hooks + statusLine |
+| `xteam rehook [--local]` | 重写 hook/statusLine；`--local` 写 settings.local.json re-write hooks + statusLine (`--local` → settings.local.json) |
 | `xteam check <path>` | 该路径是否被占用 is the path locked? |
 | `xteam acquire <path> --note "..."` | 加锁（目录锁覆盖子树）lock (dir locks cover subtree) |
 | `xteam release <path>` | 放锁（自动 @ 通知等待者）release (+ auto @-notify waiters) |
@@ -237,7 +237,7 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 | `xteam heartbeat <path>` | 续期（长任务防误判 stale）refresh a lock |
 | `xteam takeover <path>` | 接管**无主锁**（持有者会话已消失）take over an ORPHANED lock |
 | `xteam label "..."` | 给会话起名（显示 `<id>-名字`）name this session |
-| `xteam update` | 更新到最新 GitHub 版本 update to latest release |
+| `xteam update [--local]` | 更新到最新 GitHub 版本 update to latest release |
 | `xteam version` | 版本号 show version |
 
 ### 铁律 Protocol（改文件 / 派 Codex 前）before editing / delegating
@@ -327,6 +327,9 @@ A：默认自动识别，想看可读名传 `--owner 名字` 或用环境变量 
 
 **Q：多个 AI 抢同一个文件，我会看到什么？ What do I see when AIs fight over one file?**
 A：会话开头有全景、编辑被占用文件前弹 `[xteam] 冲突` 警告、群聊里能看进展。冲突警告是**提示不是硬拦截**——靠 AI 遵守协议（HELD 就换文件）；真硬碰硬时后写覆盖前写，由 git 兜底。*Startup shows the full picture, a `[xteam] 冲突` warning fires before editing a held file, and the chat shows progress. The warning is advisory, not a hard block — AIs follow the protocol (switch on HELD); a genuine collision falls back to git's last-write-wins.*
+
+**Q：用了 cc-switch 之类的切换器，每次切 provider 我的 hook 就被冲掉怎么办？ What if a config switcher (cc-switch etc.) wipes my hooks on every switch?**
+A：那些工具会重写 `~/.claude/settings.json`。用 `--local` 把 hook 写进 `settings.local.json`（切换器不碰这个文件）：`xteam rehook --local`，或重装 `node install.mjs --local`；也可设环境变量 `XTEAM_SETTINGS_LOCAL=1`，让 `xteam update` 永远写 local。*Those tools rewrite `~/.claude/settings.json`. Use `--local` to write hooks into `settings.local.json` (which they leave alone): `xteam rehook --local`, or reinstall with `node install.mjs --local`; set `XTEAM_SETTINGS_LOCAL=1` so `xteam update` always targets local.*
 
 ---
 
