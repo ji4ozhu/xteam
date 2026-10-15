@@ -554,12 +554,35 @@ function ts() {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// 全局单调消息号：独立 seq 文件 + mkdir 自旋互斥，rotate 截断日志也不重置。
+// 内容 hash 去重会漏掉「同样内容说两次」的消息，消息号是唯一可靠游标。
+function nextSeq() {
+  const seqFile = path.join(COORD, 'chat.seq');
+  const guard = seqFile + '.lock';
+  fs.mkdirSync(COORD, { recursive: true });
+  for (let i = 0; i < 50; i++) {
+    try { fs.mkdirSync(guard); break; } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      if (i === 49) throw new Error('chat.seq busy（序号锁被占超时）');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
+  try {
+    let cur = 0;
+    try { cur = parseInt(fs.readFileSync(seqFile, 'utf8'), 10) || 0; } catch {} // 首次运行无文件
+    fs.writeFileSync(seqFile, String(cur + 1));
+    return cur + 1;
+  } finally {
+    try { fs.rmdirSync(guard); } catch {}
+  }
+}
+
 function say(msg, opts) {
   const who = (opts && opts.owner) || owner();
   registerPresence();
   if (opts && opts.label) applyLabel(who, opts.label);
   const name = displayName(who);
-  const line = `[${ts()}] ${name}: ${msg}`;
+  const line = `[${ts()} #${nextSeq()}] ${name}: ${msg}`;
   fs.mkdirSync(COORD, { recursive: true });
   fs.appendFileSync(CHAT, line + '\n');
   rotate();
@@ -751,9 +774,12 @@ async function askCmd(args, opts) {
 }
 
 function parseChatLine(line) {
-  const m = line.match(/^\[([^\]]+)\] ([^:]+): ([\s\S]*)$/);
+  // ts 锚定 MM-DD HH:MM 固定宽（ts() 生成），#N 才能可靠从可选组解出——
+  // 否则非贪婪会把 #N 吞进 ts、seq 恒 0，新消息全被游标当旧消息跳过。
+  // 旧行（无 #N）seq=0，天然被基线跳过。
+  const m = line.match(/^\[(\d{2}-\d{2} \d{2}:\d{2})(?: #(\d+))?\] ([^:]+): ([\s\S]*)$/);
   if (!m) return null;
-  return { ts: m[1], display: m[2], msg: m[3] };
+  return { ts: m[1], seq: m[2] ? Number(m[2]) : 0, display: m[3], msg: m[4] };
 }
 
 function bridgeStatePath(name) {
@@ -773,9 +799,9 @@ async function bridgeReply(name, me, spec, prompt, timeoutSec) {
   try {
     const answer = await llmCall(spec, prompt, timeoutSec);
     if (/^\(silent\)\s*$/i.test(answer.trim())) return;
-    say(`[@${name}] ${flatMsg(answer)}`, { owner: me });
+    say(`[@${me}] ${flatMsg(answer)}`, { owner: me });
   } catch (e) {
-    console.log(`bridge @${name}: ${e.message}`);
+    console.log(`bridge @${me}: ${e.message}`);
   }
 }
 
@@ -790,30 +816,23 @@ async function bridgeCmd(args, opts) {
   const interval = Math.max(5, opts.interval || 60);
   const digestOn = !opts.noDigest;
   const timeoutSec = opts.timeout || 180;
-  const me = `bot-${name}`;
-  // 不设 label：displayName = owner-label，设了会拼成 bot-<name>-<name>
-  const seen = new Set(loadBridgeState(name).seen || []);
-  const sha1 = (s) => createHash('sha1').update(s).digest('hex');
-  const mark = (h) => {
-    seen.add(h);
-    if (seen.size > 400) {
-      const arr = [...seen].slice(-400);
-      seen.clear();
-      for (const x of arr) seen.add(x);
-    }
-    saveBridgeState(name, { seen: [...seen] });
-  };
-
-  // 启动基线：历史消息一律视为已读，只处理启动后的新消息——否则会把几天前的 @ 当新问题回。
-  if (fs.existsSync(CHAT)) {
-    for (const line of fs.readFileSync(CHAT, 'utf8').split('\n').filter(Boolean)) {
-      seen.add(sha1(line));
-    }
-    saveBridgeState(name, { seen: [...seen] });
+  // 显示名带模型名前缀：<model>-<name>（如 codex-advisor、gpt-5.5-reviewer），
+  // 群里一眼看出驻场 agent 背后是哪个模型。不设 label：displayName 会再拼一层。
+  const modelLabel = (parseModelSpec(spec) || parseModelSpec(process.env.XTEAM_LLM_MODEL) || { name: 'llm' }).name;
+  const me = `${modelLabel}-${name}`;
+  // 游标按全局消息号（seq）推进：rotate 截断不重置、同内容两条消息不会被误判已读。
+  const st = loadBridgeState(name);
+  const maxSeqOf = (ls) => ls.reduce((mx, l) => Math.max(mx, (parseChatLine(l) || {}).seq || 0), 0);
+  let lastSeq = st.lastSeq || 0;
+  if (!st.lastSeq) {
+    // 启动基线：历史消息一律视为已读，只处理启动后的新消息
+    const hist = fs.existsSync(CHAT) ? fs.readFileSync(CHAT, 'utf8').split('\n').filter(Boolean) : [];
+    lastSeq = maxSeqOf(hist);
+    saveBridgeState(name, { lastSeq });
   }
 
-  console.log(`BRIDGE: @${name} 驻场中 (model=${spec || process.env.XTEAM_LLM_MODEL || '?'}, digest=${digestOn ? interval + 's' : 'off'}, Ctrl+C 退出)`);
-  say(`[bridge] @${name} 驻场（跨模型桥，@${name} 提问必回）`, { owner: me });
+  console.log(`BRIDGE: @${me} 驻场中 (model=${modelLabel}, digest=${digestOn ? interval + 's' : 'off'}, from seq>${lastSeq}, Ctrl+C 退出)`);
+  say(`[bridge] @${me} 驻场（跨模型桥，@${me} 或 @${name} 提问必回，模型 ${modelLabel}）`, { owner: me });
 
   let lastDigest = Date.now();
   for (;;) {
@@ -821,18 +840,19 @@ async function bridgeCmd(args, opts) {
     const lines = fs.existsSync(CHAT) ? fs.readFileSync(CHAT, 'utf8').split('\n').filter(Boolean) : [];
     const fresh = [];
     for (const line of lines) {
-      const h = sha1(line);
-      if (seen.has(h)) continue;
-      mark(h);
       const p = parseChatLine(line);
-      if (!p) continue;
+      if (!p || p.seq <= lastSeq) continue; // 游标：只收消息号推进后的新消息
       if (p.display === me || p.display.startsWith(`${me}-`)) continue; // 自己发的
       fresh.push(p);
     }
-    const mentions = fresh.filter((p) => new RegExp(`@${escapeRe(name)}\\b`).test(p.msg));
+    if (fresh.length) {
+      lastSeq = Math.max(lastSeq, ...fresh.map((p) => p.seq));
+      saveBridgeState(name, { lastSeq });
+    }
+    const mentions = fresh.filter((p) => new RegExp(`@(?:${escapeRe(me)}|${escapeRe(name)})\\b`).test(p.msg));
     if (mentions.length) {
       const ctx = lines.slice(-12).join('\n');
-      const prompt = `你是群聊驻场 agent "@${name}"。群聊是多个 AI 协作会话共享的实时通讯（作战室）。最近消息：\n---\n${ctx}\n---\n有人 @ 了你。请以 @${name} 身份回复：简体中文、直接给结论和依据、别客套、几句话为宜。回复会被原样贴进群聊。若不值得回，只输出 (silent)。`;
+      const prompt = `你是群聊驻场 agent "@${me}"（模型 ${modelLabel}）。群聊是多个 AI 协作会话共享的实时通讯（作战室）。最近消息：\n---\n${ctx}\n---\n有人 @ 了你。请以 @${me} 身份回复：简体中文、直接给结论和依据、别客套、几句话为宜。回复会被原样贴进群聊。若不值得回，只输出 (silent)。`;
       await bridgeReply(name, me, spec, prompt, timeoutSec);
       lastDigest = Date.now();
       continue;
@@ -840,7 +860,7 @@ async function bridgeCmd(args, opts) {
     if (digestOn && fresh.length && Date.now() - lastDigest >= interval * 1000) {
       lastDigest = Date.now();
       const ctx = lines.slice(-20).join('\n');
-      const prompt = `你是群聊驻场 agent "@${name}"。以下是群聊新消息：\n---\n${ctx}\n---\n判断你是否有实质贡献（纠错、补充依据、指出失败路径）。有则以 @${name} 身份发言（简体中文、短、直接）；没有、或只是闲聊/礼貌，只输出 (silent)。`;
+      const prompt = `你是群聊驻场 agent "@${me}"（模型 ${modelLabel}）。以下是群聊新消息：\n---\n${ctx}\n---\n判断你是否有实质贡献（纠错、补充依据、指出失败路径）。有则以 @${me} 身份发言（简体中文、短、直接）；没有、或只是闲聊/礼貌，只输出 (silent)。`;
       await bridgeReply(name, me, spec, prompt, timeoutSec);
     }
   }

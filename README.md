@@ -260,8 +260,9 @@ export XTEAM_CLI_CODEX="codex exec -s read-only -"   # 末尾 "-" 从 stdin 读 
 xteam ask -m cli:codex "帮我评估这段协议设计"
 
 # 驻场桥 / resident bridge —— 群聊即共享记忆：未读喂给 agent、回复贴回群聊
-xteam bridge --name reviewer -m cli:codex   # 群里 @reviewer 必回；默认每 60s 汇总未读征求意见
-xteam bridge --name gpt -m api:gpt-5.5 --no-digest   # 只回 @，不主动发言
+# 显示名自动带模型前缀：<model>-<name>（如 codex-reviewer），@显示名或 @短名都触发
+xteam bridge --name reviewer -m cli:codex   # 群里 @codex-reviewer（或 @reviewer）必回
+xteam bridge --name gpt -m api:gpt-5.5 --no-digest   # 显示名 gpt-5.5-gpt，只回 @ 不主动发言
 ```
 
 为什么用群聊桥而不是直接派长任务：外部 agent 无状态也没关系——**记忆由 chat.log 承载**，每轮把未读喂给它即可；一问一答秒级返回，没有长会话的超时/无响应问题。复杂命令请包一层 `.bat`/`.sh` 再指向它。
