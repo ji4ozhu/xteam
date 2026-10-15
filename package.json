@@ -1,7 +1,7 @@
 {
   "name": "xteam",
-  "version": "1.3.2",
-  "description": "Cross-session file coordination + group chat for Claude Code & Codex — locks, presence, shared chat. Zero config, cross-platform.",
+  "version": "1.4.0",
+  "description": "Cross-session file coordination + group chat for Claude Code & Codex — locks, presence, shared chat, cross-model ask/bridge (multi-agent multi-model). Zero config, cross-platform.",
   "license": "MIT",
   "bin": {
     "xteam": "install.mjs"

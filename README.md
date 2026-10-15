@@ -48,6 +48,7 @@ After installing it, you don't need to do anything — it automatically activate
 | 🧭 **结尾自动简报 Auto briefing** | 底部状态栏每轮回复后刷新一行简报。A statusLine refreshes a one-line summary after every reply. |
 | 🚨 **冲突自动警告 Conflict warning** | 编辑被他人占用的文件前，PreToolUse hook 自动弹 `[xteam] 冲突`。Warns before you edit a file someone else holds. |
 | 🤝 **Codex/GPT 协作 Codex/GPT collab** | 先锁路径再派 Codex，Claude 指挥、Codex 落盘。Lock paths first, then delegate — Claude directs, Codex writes. |
+| 🌉 **跨模型桥 Cross-model bridge** | `ask` 单次咨询任意模型 / `bridge` 让 codex、cursor 等外部 agent 驻场进群聊：@它必回，群聊即共享记忆，多 agent 多模型实时协作。Ask any model once, or make codex/cursor a resident chat agent — `@name` mentions get replies; the chat itself is the shared memory. |
 | 🌍 **跨平台 Cross-platform** | Windows / macOS / Linux，纯 Node 内置模块，零第三方依赖。Pure Node builtins, zero deps. |
 | 🪶 **省 token Token-lean** | 状态只输出摘要 + 最近几条聊天，不会 `cat` 整个日志。Summaries only, never dumps the log. |
 
@@ -233,12 +234,37 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 | `xteam release --all` | 放掉本会话所有锁（收尾必做）release ALL your locks |
 | `xteam wait <path>` | 排队等锁，一放开自动接手 queue up; auto-acquire on release |
 | `xteam say "..."` | 发到群聊 post to group chat |
+| `xteam ask [--say] -m <spec> "..."` | 单次跨模型咨询（可 `--say` 贴进群聊）ask another model once |
+| `xteam bridge --name N -m <spec>` | 驻场跨模型 agent 进群聊（`@N` 必回）resident cross-model agent in chat |
 | `xteam tail [N]` | 最近 N 条聊天 last N chat lines |
 | `xteam heartbeat <path>` | 续期（长任务防误判 stale）refresh a lock |
 | `xteam takeover <path>` | 接管**无主锁**（持有者会话已消失）take over an ORPHANED lock |
 | `xteam label "..."` | 给会话起名（显示 `<id>-名字`）name this session |
 | `xteam update [--local]` | 更新到最新 GitHub 版本 update to latest release |
 | `xteam version` | 版本号 show version |
+
+### 跨模型 Cross-model（`ask` · `bridge`）
+
+模型 spec：`api:<model>`（OpenAI 兼容口）· `cli:<name>`（任意本地 CLI，如 codex/cursor-agent）· 裸模型名（=api:）。
+*Model spec: `api:<model>` (OpenAI-compatible) · `cli:<name>` (any local CLI like codex/cursor-agent) · bare name (=api:).*
+
+```bash
+# api 后端 / api backend
+export XTEAM_LLM_API_BASE=https://api.openai.com/v1   # 或任何 OpenAI 兼容口
+export XTEAM_LLM_API_KEY=sk-...
+xteam ask -m api:gpt-5.5 "这个失败路径成立吗？"
+xteam ask --say -m api:gpt-5.5 "..."        # 问答贴进群聊，所有会话可见
+
+# cli 后端 / cli backend —— {text}=prompt 作独立 argv（不经 shell，安全），{file}=临时文件；无占位走 stdin
+export XTEAM_CLI_CODEX="codex exec --full-auto {text}"
+xteam ask -m cli:codex "帮我评估这段协议设计"
+
+# 驻场桥 / resident bridge —— 群聊即共享记忆：未读喂给 agent、回复贴回群聊
+xteam bridge --name reviewer -m cli:codex   # 群里 @reviewer 必回；默认每 60s 汇总未读征求意见
+xteam bridge --name gpt -m api:gpt-5.5 --no-digest   # 只回 @，不主动发言
+```
+
+为什么用群聊桥而不是直接派长任务：外部 agent 无状态也没关系——**记忆由 chat.log 承载**，每轮把未读喂给它即可；一问一答秒级返回，没有长会话的超时/无响应问题。复杂命令请包一层 `.bat`/`.sh` 再指向它。
 
 ### 铁律 Protocol（改文件 / 派 Codex 前）before editing / delegating
 

@@ -10,14 +10,14 @@
 // A lock covers its own path and everything beneath it (lock "src/auth" also
 // covers "src/auth/login.ts"). Staleness = lastSeenAt/heartbeat age > TTL.
 
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.3.2';
+const VERSION = '1.4.0';
 const REPO_RAW = 'https://raw.githubusercontent.com/ji4ozhu/xteam/main';
 const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));   // ~/.claude/skills/xteam
 const SKILL_DIR = SELF_DIR;
@@ -554,6 +554,229 @@ function setLabel(text) {
   console.log(`LABEL: ${who}-${text}  / 已命名`);
 }
 
+// ——— cross-model: ask / bridge（api: 或 cli: 后端） ———
+// 群聊即共享记忆：外部 agent（codex/cursor/...）无状态也没关系——
+// 桥每轮把未读消息喂给它，它的回复贴回群聊，记忆由 chat.log 承载。
+// model spec: api:<model> | cli:<name> | <model>（默认 api:）
+//   api → OpenAI 兼容 POST {XTEAM_LLM_API_BASE}/chat/completions（Bearer XTEAM_LLM_API_KEY）
+//   cli → 环境变量 XTEAM_CLI_<NAME> 命令模板；{text}=prompt 作为独立 argv 元素（不经 shell，安全），
+//         {file}=临时文件路径；都无占位则 prompt 走 stdin。复杂命令请包一层 .bat/.sh 再指向它。
+
+function parseModelSpec(spec) {
+  const s = String(spec || process.env.XTEAM_LLM_MODEL || '').trim();
+  if (!s) return null;
+  if (s.startsWith('cli:')) return { kind: 'cli', name: s.slice(4) };
+  if (s.startsWith('api:')) return { kind: 'api', name: s.slice(4) };
+  return { kind: 'api', name: s };
+}
+
+function escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function flatMsg(s) {
+  // chat.log 一行一条消息，回复里的换行压平，保住行格式
+  return String(s).replace(/\r?\n+/g, ' ⏎ ');
+}
+
+function tokenizeTemplate(tpl) {
+  const out = [];
+  const re = /"[^"]*"|\{text\}|\{file\}|\S+/g;
+  let m;
+  while ((m = re.exec(tpl))) {
+    let tok = m[0];
+    if (tok.length >= 2 && tok.startsWith('"') && tok.endsWith('"')) tok = tok.slice(1, -1);
+    out.push(tok);
+  }
+  return out;
+}
+
+async function llmApiCall(model, prompt, timeoutSec) {
+  const base = (process.env.XTEAM_LLM_API_BASE || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  const key = process.env.XTEAM_LLM_API_KEY;
+  if (!key) {
+    throw new Error('XTEAM_LLM_API_KEY 未设置（set XTEAM_LLM_API_KEY, or use cli: backend）');
+  }
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), (timeoutSec || 120) * 1000);
+  try {
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }] }),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`LLM API HTTP ${res.status}: ${body.slice(0, 200)}`);
+    }
+    const j = await res.json();
+    const text = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('LLM API 返回空（empty choices[0].message.content）');
+    }
+    return text.trim();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function llmCliCall(name, prompt, timeoutSec) {
+  const key = 'XTEAM_CLI_' + String(name).toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  const tpl = process.env[key];
+  if (!tpl) {
+    throw new Error(`${key} 未设置（set ${key}="cmd {text}" 或 "cmd" 走 stdin）`);
+  }
+  let tmp = null;
+  try {
+    const toks = tokenizeTemplate(tpl);
+    const args = [];
+    let useStdin = true;
+    for (const tok of toks) {
+      if (tok === '{text}') { args.push(prompt); useStdin = false; }
+      else if (tok === '{file}') {
+        if (!tmp) {
+          tmp = path.join(os.tmpdir(), `xteam-prompt-${process.pid}-${Date.now()}.txt`);
+          fs.writeFileSync(tmp, prompt);
+        }
+        args.push(tmp);
+        useStdin = false;
+      } else args.push(tok);
+    }
+    const exe = args.shift();
+    if (!exe) throw new Error(`${key} 模板为空`);
+    const r = spawnSync(exe, args, {
+      input: useStdin ? prompt : undefined,
+      timeout: (timeoutSec || 180) * 1000,
+      encoding: 'utf8',
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    if (r.error) throw r.error;
+    if (r.status !== 0) {
+      throw new Error(`${key} exit ${r.status}${r.stderr ? ': ' + String(r.stderr).slice(0, 200) : ''}`);
+    }
+    const out = String(r.stdout || '').trim();
+    if (!out) throw new Error(`${key} 无输出（empty stdout）`);
+    return out;
+  } finally {
+    if (tmp) { try { fs.unlinkSync(tmp); } catch {} }
+  }
+}
+
+async function llmCall(spec, prompt, timeoutSec) {
+  const p = parseModelSpec(spec);
+  if (!p) {
+    throw new Error('缺少模型 spec：--model api:<model> 或 cli:<name>（或设 XTEAM_LLM_MODEL）');
+  }
+  return p.kind === 'cli' ? llmCliCall(p.name, prompt, timeoutSec) : llmApiCall(p.name, prompt, timeoutSec);
+}
+
+async function askCmd(args, opts) {
+  const prompt = args.join(' ').trim();
+  if (!prompt) {
+    console.log('usage: xteam ask [--say] [--model <spec>] [--timeout <s>] <prompt>');
+    console.log('  spec: api:<model> | cli:<name> | <model>(=api:)  — 详见 xteam help');
+    return;
+  }
+  const spec = opts.model;
+  const label = parseModelSpec(spec);
+  console.log(`ASK: ${label ? label.kind + ':' + label.name : '(XTEAM_LLM_MODEL)'}`);
+  const answer = await llmCall(spec, prompt, opts.timeout || 120);
+  if (opts.say) {
+    const tag = label ? `${label.kind}:${label.name}` : 'llm';
+    say(`[${tag}] Q: ${flatMsg(prompt)} || A: ${flatMsg(answer)}`, {});
+  }
+  console.log(answer);
+}
+
+function parseChatLine(line) {
+  const m = line.match(/^\[([^\]]+)\] ([^:]+): ([\s\S]*)$/);
+  if (!m) return null;
+  return { ts: m[1], display: m[2], msg: m[3] };
+}
+
+function bridgeStatePath(name) {
+  return path.join(COORD, 'bridge', `${String(name).replace(/[^\w.-]/g, '_')}.json`);
+}
+
+function loadBridgeState(name) {
+  try { return JSON.parse(fs.readFileSync(bridgeStatePath(name), 'utf8')); } catch { return { seen: [] }; }
+}
+
+function saveBridgeState(name, st) {
+  fs.mkdirSync(path.join(COORD, 'bridge'), { recursive: true });
+  fs.writeFileSync(bridgeStatePath(name), JSON.stringify(st));
+}
+
+async function bridgeReply(name, me, spec, prompt, timeoutSec) {
+  try {
+    const answer = await llmCall(spec, prompt, timeoutSec);
+    if (/^\(silent\)\s*$/i.test(answer.trim())) return;
+    say(`[@${name}] ${flatMsg(answer)}`, { owner: me });
+  } catch (e) {
+    console.log(`bridge @${name}: ${e.message}`);
+  }
+}
+
+async function bridgeCmd(args, opts) {
+  const name = opts.name;
+  if (!name) {
+    console.log('usage: xteam bridge --name <n> --model <spec> [--interval <s>] [--no-digest] [--timeout <s>]');
+    console.log('  驻场跨模型 agent：@<n> 必回；默认每 <interval>s 汇总未读问一次（无贡献输出 (silent)）');
+    return;
+  }
+  const spec = opts.model;
+  const interval = Math.max(5, opts.interval || 60);
+  const digestOn = !opts.noDigest;
+  const timeoutSec = opts.timeout || 180;
+  const me = `bot-${name}`;
+  // 不设 label：displayName = owner-label，设了会拼成 bot-<name>-<name>
+  const seen = new Set(loadBridgeState(name).seen || []);
+  const sha1 = (s) => createHash('sha1').update(s).digest('hex');
+  const mark = (h) => {
+    seen.add(h);
+    if (seen.size > 400) {
+      const arr = [...seen].slice(-400);
+      seen.clear();
+      for (const x of arr) seen.add(x);
+    }
+    saveBridgeState(name, { seen: [...seen] });
+  };
+
+  console.log(`BRIDGE: @${name} 驻场中 (model=${spec || process.env.XTEAM_LLM_MODEL || '?'}, digest=${digestOn ? interval + 's' : 'off'}, Ctrl+C 退出)`);
+  say(`[bridge] @${name} 驻场（跨模型桥，@${name} 提问必回）`, { owner: me });
+
+  let lastDigest = Date.now();
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const lines = fs.existsSync(CHAT) ? fs.readFileSync(CHAT, 'utf8').split('\n').filter(Boolean) : [];
+    const fresh = [];
+    for (const line of lines) {
+      const h = sha1(line);
+      if (seen.has(h)) continue;
+      mark(h);
+      const p = parseChatLine(line);
+      if (!p) continue;
+      if (p.display === me || p.display.startsWith(`${me}-`)) continue; // 自己发的
+      fresh.push(p);
+    }
+    const mentions = fresh.filter((p) => new RegExp(`@${escapeRe(name)}\\b`).test(p.msg));
+    if (mentions.length) {
+      const ctx = lines.slice(-12).join('\n');
+      const prompt = `你是群聊驻场 agent "@${name}"。群聊是多个 AI 协作会话共享的实时通讯（作战室）。最近消息：\n---\n${ctx}\n---\n有人 @ 了你。请以 @${name} 身份回复：简体中文、直接给结论和依据、别客套、几句话为宜。回复会被原样贴进群聊。若不值得回，只输出 (silent)。`;
+      await bridgeReply(name, me, spec, prompt, timeoutSec);
+      lastDigest = Date.now();
+      continue;
+    }
+    if (digestOn && fresh.length && Date.now() - lastDigest >= interval * 1000) {
+      lastDigest = Date.now();
+      const ctx = lines.slice(-20).join('\n');
+      const prompt = `你是群聊驻场 agent "@${name}"。以下是群聊新消息：\n---\n${ctx}\n---\n判断你是否有实质贡献（纠错、补充依据、指出失败路径）。有则以 @${name} 身份发言（简体中文、短、直接）；没有、或只是闲聊/礼貌，只输出 (silent)。`;
+      await bridgeReply(name, me, spec, prompt, timeoutSec);
+    }
+  }
+}
+
 // ——— version & self-update ———
 async function download(rel) {
   const res = await fetch(`${REPO_RAW}/${rel}`);
@@ -734,6 +957,9 @@ Commands / 子命令:
   xteam takeover <path>              接管过期锁 / clear & re-acquire a stale lock
   xteam label <名称>                 给本会话起名(显示为 <id>-<名称>) / name this session
   xteam say <message> [--label L]    发到群聊 / post to group chat
+  xteam ask [--say] [-m <spec>] <prompt>   单次跨模型咨询 / ask another model once
+  xteam bridge --name <n> -m <spec> [--interval <s>] [--no-digest]
+                                       驻场跨模型 agent 进群聊（@<n> 必回）/ resident cross-model agent
   xteam tail [N]                     最近 N 条聊天 / last N chat lines (default 20)
   xteam update [--local]             更新到最新 GitHub 版本 / update to latest GitHub release
   xteam version                      版本号 / version
@@ -744,6 +970,16 @@ Owner / 身份:     自动取自当前会话 (auto-detected from session); --own
 Label / 名字:     用 \`xteam label\` 或 \`--label\` 或 XTEAM_LABEL 设置，显示为 <id>-<名字>
 TTL / 过期:       ${TTL}s (XTEAM_TTL); 日志上限 ${LOG_MAX} 条 (XTEAM_LOG_MAX)
 Wait / 等锁:      轮询 ${WAIT_POLL}s (XTEAM_WAIT_POLL)，上限 ${WAIT_MAX}s (XTEAM_WAIT_MAX)
+
+跨模型 / cross-model (ask · bridge):
+  spec = api:<model> | cli:<name> | <model>(=api:)   默认取 XTEAM_LLM_MODEL
+  api:  XTEAM_LLM_API_BASE (default https://api.openai.com/v1, OpenAI 兼容口均可)
+        XTEAM_LLM_API_KEY  (必设)
+  cli:  XTEAM_CLI_<NAME> = 命令模板，如 XTEAM_CLI_CODEX="codex exec --full-auto {text}"
+        {text}=prompt 作独立 argv（不经 shell）；{file}=临时文件路径；无占位走 stdin
+        复杂命令请包一层 .bat/.sh 再指向它
+  bridge: 群聊即共享记忆 —— 未读喂给 agent、回复贴回群聊；@<name> 必回，
+          默认每 <interval>s 汇总未读征求意见（无贡献则 (silent)），--no-digest 只回 @
 Hook 位置 / hooks:  默认写 settings.json；--local 或 XTEAM_SETTINGS_LOCAL=1 则写 settings.local.json（防 cc-switch 等切换器冲掉）
 
 默认已启用 / enabled by default:
@@ -757,7 +993,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const rest = argv.slice(1);
-  const opts = { owner: null, note: null, label: null, all: false, local: false };
+  const opts = { owner: null, note: null, label: null, all: false, local: false, model: null, say: false, name: null, interval: null, timeout: null, noDigest: false };
   const pos = [];
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--owner' && rest[i + 1]) { opts.owner = rest[i + 1]; i++; }
@@ -765,6 +1001,12 @@ async function main() {
     else if (rest[i] === '--label' && rest[i + 1]) { opts.label = rest[i + 1]; i++; }
     else if (rest[i] === '--all') { opts.all = true; }
     else if (rest[i] === '--local') { opts.local = true; }
+    else if ((rest[i] === '--model' || rest[i] === '-m') && rest[i + 1]) { opts.model = rest[i + 1]; i++; }
+    else if (rest[i] === '--say') { opts.say = true; }
+    else if (rest[i] === '--name' && rest[i + 1]) { opts.name = rest[i + 1]; i++; }
+    else if (rest[i] === '--interval' && rest[i + 1]) { opts.interval = Number(rest[i + 1]); i++; }
+    else if (rest[i] === '--timeout' && rest[i + 1]) { opts.timeout = Number(rest[i + 1]); i++; }
+    else if (rest[i] === '--no-digest') { opts.noDigest = true; }
     else pos.push(rest[i]);
   }
   switch (cmd) {
@@ -783,6 +1025,8 @@ async function main() {
     case 'say':
     case 'log':
     case 'chat': return say(pos.join(' '), opts);
+    case 'ask': return await askCmd(pos, opts);
+    case 'bridge': return await bridgeCmd(pos, opts);
     case 'tail': return tailCmd(pos[0]);
     case 'preedit': return preedit();
     case 'update':
