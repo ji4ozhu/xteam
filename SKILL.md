@@ -46,11 +46,12 @@ node ~/.claude/skills/xteam/xteam.mjs <子命令>   # 下文简写为 xteam
 5. **放** `xteam release <path>`（自动 @ 通知排队者）。
 6. **收尾** `xteam release --all`——会话退出后没人替你放锁。
 
-**锁不会因为「很久没动」就能抢**，判据是持有者会话是否还活着（presence 心跳）：
-`owner is ALIVE`（可能在长落盘，**绝不能抢**）→ 后台 wait 或群里问；
-`会话已退出` → 等到期或后台 wait；
-`ORPHANED/无主` → `xteam takeover <path>` 可安全接管。
-你自己的锁在每次 `status`/`check` 时自动续期。
+**锁不会因为「很久没动」就能抢**——租期 + 通牒双重保护，区分「慢而活」和「死/忘放锁」：
+
+- **租期内（默认 30 分钟，`acquire --lease <秒>` 可拉长）绝对不可抢**：正常干活的会话每轮 `status`/`check`/`say` 自动滑动续锁，慢工长任务用 `--lease 2h` 之类声明，再配 `heartbeat` 续期。
+- **租期过 = 通牒候选**：`wait` 的排队者会先在群里 `@你` 下最后通牒（默认 300s 宽限，`XTEAM_TAKEOVER_GRACE`）——**宽限内你只要 `say` 一句或 `heartbeat` 一下，通牒作废、锁保住**；只有持续零响应才会被按排队顺序接管（防止一个死锁连累所有人）。
+- `ORPHANED/无主`（会话消失且锁过期）→ `xteam takeover` 或排队者直接自动接手。
+- `heartbeat`/`release` 只能操作自己的锁（`--force` 显式越权）。
 
 **wait 必须后台跑**（`run_in_background=true`）然后**结束本轮**——它 @ 持有者、排队、放锁瞬间自动接手并被 `<task-notification>` 唤醒。不要轮询、不要 sleep 守着。启动后用人话汇报再收尾：
 

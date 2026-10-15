@@ -28,6 +28,8 @@ const LOG_MAX = Number(process.env.XTEAM_LOG_MAX || 200);        // chat log rot
 const STATUS_CHAT = Number(process.env.XTEAM_STATUS_CHAT || 5);  // chat lines in `status`
 const WAIT_POLL = Number(process.env.XTEAM_WAIT_POLL || 5);      // seconds between wait polls
 const WAIT_MAX = Number(process.env.XTEAM_WAIT_MAX || 900);      // max seconds for `wait`
+const LEASE = Number(process.env.XTEAM_LEASE || 1800);           // 锁默认租期：允许持有者最长多久不碰锁（滑动续期；长任务用 acquire --lease 拉长）
+const TAKEOVER_GRACE = Number(process.env.XTEAM_TAKEOVER_GRACE || 300); // 租期过后的接管宽限：先 @ 持有者下最后通牒，超时无响应才真接管
 
 // ——— i18n：按系统语言渲染输出 ———
 // 内置中英默认模板（无 AI 也完整可用）；其他语言首次使用时调 LLM 翻译一次，
@@ -103,6 +105,12 @@ const MSG = {
   models_none: ['（无）', '(none)'],
   models_api_fail: ['API 枚举失败: {reason}', 'API listing failed: {reason}'],
   models_hint: ['cli 后端的模型由各 CLI 自己决定（codex：模板里 -m <model> 指定）', 'cli backend models depend on the CLI itself (codex: -m <model> in the template)'],
+  held_tag_stale: [' (锁陈旧，可接管)', ' (STALE, takeable)'],
+  wait_auto_takeover: ['{path} — 持有者已消失或锁陈旧（idle={idle}s），自动接管', '{path} — owner gone or lock stale (idle={idle}s), taking over automatically'],
+  wait_taken_note: ['{path} 原持有者 {owner} 未放锁（{reason}），我按排队顺序接手了', '{path} — previous holder {owner} never released ({reason}); I am taking over per queue'],
+  wait_grace_notice: ['⚠ {path} 的锁已 {idle}s 没动（租期已过）。@{owner} 你若还在改这个文件，立刻 xteam say 一句或 heartbeat 续锁；{grace}s 内无响应我将自动接管', '⚠ lock {path} idle {idle}s (lease expired). @{owner} if you are still working on it, xteam say or heartbeat NOW; without a response within {grace}s I take over'],
+  takeover_stale: ['takeover: 锁陈旧（idle={idle}s，持有者 {alive}），已接管 {path}', 'takeover: lock was stale (idle={idle}s, owner {alive}), took over {path}'],
+  wake_stale_locks: ['锁陈旧可被排队者接管：{names}', 'stale locks takeable by waiters: {names}'],
 };
 const MSG_KEYS = Object.keys(MSG);
 function msgEnTable() {
@@ -320,7 +328,9 @@ function report(p, key, via) {
   const st = m ? lockState(m) : { tag: 'orphaned', idle: 0, alive: false };
   const viaStr = via && via !== p ? ` [via ${via}]` : '';
   const note = m && m.note ? t('held_note', { note: m.note }) : '';
-  const tag = st.tag === 'orphaned' ? t('held_tag_orphaned') : st.alive ? '' : t('held_tag_gone');
+  const tag = st.tag === 'orphaned' ? t('held_tag_orphaned')
+    : st.tag === 'stale' ? t('held_tag_stale')
+    : st.alive ? '' : t('held_tag_gone');
   console.log(`${t('held_head', { via: p + viaStr })} — ${t('held_owner', { owner: displayName(who), idle: st.idle })}${tag}${note}`);
   const queue = listWaiters(p);
   if (queue.length) {
@@ -329,6 +339,8 @@ function report(p, key, via) {
   if (st.tag === 'orphaned') {
     console.log(t('hint_takeover_safe'));
     console.log(`    xteam takeover ${p}`);
+  } else if (st.tag === 'stale') {
+    console.log(t('safe_takeover_cmd', { path: p }));
   } else if (st.alive) {
     console.log(t('hint_owner_alive', { path: p }));
   } else {
@@ -401,7 +413,7 @@ function acquire(p, opts) {
     throw e;
   }
   const t0 = nowSec();
-  const meta = { path: p, owner: opts.owner || owner(), note: opts.note || '', acquiredAt: t0, heartbeatAt: t0 };
+  const meta = { path: p, owner: opts.owner || owner(), note: opts.note || '', lease: opts.lease || 0, acquiredAt: t0, heartbeatAt: t0 };
   writeMetaAtomic(key, meta);
   console.log(`ACQUIRED: ${p} (owner=${displayName(meta.owner)})  / ${t('acquired')}`);
 }
@@ -448,12 +460,16 @@ function releaseAll() {
   console.log(t('released_all', { n: mine.length }));
 }
 
-function heartbeat(p) {
+function heartbeat(p, opts) {
   p = normalize(p);
   const key = lockDir(p);
   const m = readMeta(key);
   if (!m) {
     console.log(`NOT HELD: ${p}`);
+    return;
+  }
+  if (m.owner !== owner() && !(opts && opts.force)) {
+    console.log(`REFUSED: ${p} — 这把锁属于 ${displayName(m.owner)}，你不能替它续期 / not your lock.`);
     return;
   }
   m.heartbeatAt = nowSec();
@@ -509,6 +525,7 @@ function wait(p, opts) {
   console.log(t('polling', { poll: WAIT_POLL, max: WAIT_MAX }));
 
   const deadline = nowSec() + WAIT_MAX;
+  let graceStartedAt = 0;
   for (;;) {
     sleepSync(WAIT_POLL);
     const cur = findHeld(p);
@@ -520,11 +537,31 @@ function wait(p, opts) {
     const cm = readMeta(cur.key);
     const st = cm ? lockState(cm) : { tag: 'orphaned', idle: 0, alive: false };
     if (st.tag === 'orphaned') {
+      // 会话已消失且锁过期：直接接管
       dropWaiter(p, me);
-      console.log(t('orphaned_notice', { path: p, owner: displayName((cm && cm.owner) || '?'), idle: st.idle }));
-      console.log(t('safe_takeover_cmd', { path: p }));
-      return;
+      console.log(t('wait_auto_takeover', { path: p, idle: st.idle }));
+      say(t('wait_taken_note', { path: p, owner: displayName((cm && cm.owner) || '?'), reason: t('held_tag_gone').trim() }), { owner: me });
+      fs.rmSync(cur.key, { recursive: true, force: true });
+      return acquire(p, opts);
     }
+    if (st.tag === 'stale') {
+      // 租期过的两阶段接管：先下最后通牒给宽限，持有者一有动作就作废——
+      // 慢工的活会话在宽限内 say/heartbeat 即可保住锁，防止两人改同一文件。
+      if (!graceStartedAt) {
+        graceStartedAt = nowSec();
+        console.log(t('wait_grace_notice', { path: p, owner: displayName((cm && cm.owner) || '?'), idle: st.idle, grace: TAKEOVER_GRACE }));
+        say(t('wait_grace_notice', { path: p, owner: displayName((cm && cm.owner) || '?'), idle: st.idle, grace: TAKEOVER_GRACE }), { owner: me });
+      }
+      if (nowSec() - graceStartedAt >= TAKEOVER_GRACE) {
+        dropWaiter(p, me);
+        console.log(t('wait_auto_takeover', { path: p, idle: st.idle }));
+        say(t('wait_taken_note', { path: p, owner: displayName((cm && cm.owner) || '?'), reason: t('held_tag_stale').trim() }), { owner: me });
+        fs.rmSync(cur.key, { recursive: true, force: true });
+        return acquire(p, opts);
+      }
+      continue; // 宽限中：不刷新 waiter 心跳也不放弃，下轮复检是否被续期
+    }
+    graceStartedAt = 0; // 回到 held：持有者动了（续期/心跳），通牒作废
     addWaiter(p, me, opts.note);   // keep our waiter entry fresh
     if (nowSec() >= deadline) {
       console.log(t('timeout_still_held', { path: p, owner: displayName((cm && cm.owner) || '?'), max: WAIT_MAX }));
@@ -540,20 +577,24 @@ function takeover(p, opts) {
   const m = readMeta(key);
   if (m) {
     const st = lockState(m);
-    if (st.alive) {
+    if (st.tag === 'stale') {
+      // 租期过：即使会话在线也可接管——真在干活的会话每轮都续锁，stale 说明它停摆了
+      fs.rmSync(key, { recursive: true, force: true });
+      console.log(t('takeover_stale', { idle: st.idle, alive: st.alive ? 'ALIVE' : 'gone' }));
+    } else if (st.alive) {
       report(p, key);
       console.log(t('takeover_alive', { idle: st.idle }));
       console.log(t('takeover_alive_hint', { path: p }));
       return;
-    }
-    if (st.tag !== 'orphaned') {
+    } else if (st.tag !== 'orphaned') {
       report(p, key);
       console.log(t('takeover_notyet', { in: fmtIdle(TTL - st.idle) }));
       console.log(t('takeover_notyet_hint', { path: p }));
       return;
+    } else {
+      fs.rmSync(key, { recursive: true, force: true });
+      console.log(t('takeover_cleared', { path: p }));
     }
-    fs.rmSync(key, { recursive: true, force: true });
-    console.log(t('takeover_cleared', { path: p }));
   }
   acquire(p, opts);
 }
@@ -581,13 +622,18 @@ function ownerAlive(who) {
   return nowSec() - (m.lastSeenAt || 0) <= TTL;
 }
 
-// A lock is only safe to take over when its OWNER is gone — not merely when
-// the lock itself has sat still. Long work must not look like death.
+// 锁的三态：
+//   held     —— 租期内绝对持有（idle ≤ lease）。慢工的活会话靠 say/heartbeat 滑动续期，绝不能被抢。
+//   stale    —— 租期过了：只是「通牒候选」。wait 接管前必须 @ 持有者下最后通牒并给宽限期，
+//               持有者在宽限内一有动作就作废通牒——区分「慢而活」与「死/忘放锁」。
+//   orphaned —— 会话已消失且锁也过期：可直接接管。
 function lockState(m) {
   const idle = nowSec() - (m.heartbeatAt || 0);
-  if (ownerAlive(m.owner)) return { tag: 'held', idle, alive: true };
-  if (idle > TTL) return { tag: 'orphaned', idle, alive: false };
-  return { tag: 'held', idle, alive: false };
+  const alive = ownerAlive(m.owner);
+  const lease = Number(m.lease) > 0 ? Number(m.lease) : LEASE;
+  if (idle <= lease) return { tag: 'held', idle, alive };
+  if (!alive && idle > TTL) return { tag: 'orphaned', idle, alive: false };
+  return { tag: 'stale', idle, alive };
 }
 
 // Renew every lock this session holds. Called from status/check, so simply
@@ -646,10 +692,11 @@ function status() {
   }
   const orphans = [];
   for (const m of locks) {
-    if (active.some((p) => p.owner === m.owner)) continue; // already shown under its session
     const st = lockState(m);
-    if (st.tag === 'orphaned') orphans.push(m.path);
-    const tag = st.tag === 'orphaned' ? t('st_orphaned_tag') : t('st_gone_tag');
+    if (st.tag === 'orphaned' || st.tag === 'stale') orphans.push(m.path);
+    // 已在会话行展示过的活锁不重复列；stale/无主锁必须显式暴露
+    if (st.tag !== 'stale' && st.tag !== 'orphaned' && active.some((p) => p.owner === m.owner)) continue;
+    const tag = st.tag === 'orphaned' ? t('st_orphaned_tag') : st.tag === 'stale' ? t('held_tag_stale') : t('st_gone_tag');
     console.log(`  [lock] ${m.path}  owner=${displayName(m.owner)}  idle=${fmtIdle(st.idle)}${tag}${m.note ? ` (${m.note})` : ''}`);
   }
   if (orphans.length) {
@@ -1332,6 +1379,7 @@ async function main() {
     else if ((rest[i] === '--model' || rest[i] === '-m') && rest[i + 1]) { opts.model = rest[i + 1]; i++; }
     else if (rest[i] === '--say') { opts.say = true; }
     else if (rest[i] === '--name' && rest[i + 1]) { opts.name = rest[i + 1]; i++; }
+    else if (rest[i] === '--lease' && rest[i + 1]) { opts.lease = Number(rest[i + 1]) || null; i++; }
     else if (rest[i] === '--interval' && rest[i + 1]) { opts.interval = Number(rest[i + 1]) || null; i++; }
     else if (rest[i] === '--timeout' && rest[i + 1]) { opts.timeout = Number(rest[i + 1]) || null; i++; }
     else if (rest[i] === '--no-digest') { opts.noDigest = true; }
@@ -1343,7 +1391,7 @@ async function main() {
     case 'acquire': return acquire(pos[0] || '', opts);
     case 'release': return opts.all ? releaseAll() : release(pos[0] || '', opts);
     case 'wait': return wait(pos[0] || '', opts);
-    case 'heartbeat': return heartbeat(pos[0] || '');
+    case 'heartbeat': return heartbeat(pos[0] || '', opts);
     case 'takeover': return takeover(pos[0] || '', opts);
     case 'list':
     case 'status': return status();
