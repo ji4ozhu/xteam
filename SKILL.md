@@ -117,14 +117,14 @@ Xteam: actor.rs 等待超时，持有者 e193b67b 仍活跃（idle 3m）。
 
 ## 跨模型 ask / bridge（多 agent 多模型协作）
 
-把其他模型/外部 agent（codex、cursor-agent、任何 CLI）拉进同一个作战室：
+把外部 agent（主打 codex/GPT）拉进同一个作战室，与 Claude 会话混编协作：
 
 - **单次咨询** `xteam ask [-m <spec>] [--say] "问题"`：即问即答；`--say` 把问答贴进群聊所有会话可见。
 - **驻场桥** `xteam bridge --name <n> -m <spec> [--interval <s>] [--no-digest]`（后台跑）：
   群里 `@<n> ...` 必回；默认每 `<interval>`（60s）把未读群聊打包征求意见（无贡献输出 `(silent)` 则不贴），`--no-digest` 只回 @。
   **群聊即共享记忆**——外部 agent 无状态也没关系，每轮把未读喂给它、回复贴回群聊即可。
 
-model spec：`api:<model>`（OpenAI 兼容口，需 `XTEAM_LLM_API_BASE` + `XTEAM_LLM_API_KEY`）· `cli:<name>`（需 `XTEAM_CLI_<NAME>` 命令模板，`{text}`=prompt 独立 argv 不经 shell、`{file}`=临时文件、无占位走 stdin）· 裸模型名（=api:，模型可由 `XTEAM_LLM_MODEL` 兜底）。复杂命令包一层 `.bat`/`.sh` 再指向它。
+model spec：`api:<model>`（OpenAI 兼容口，需 `XTEAM_LLM_API_BASE` + `XTEAM_LLM_API_KEY`）· `cli:<name>`（需 `XTEAM_CLI_<NAME>` 命令模板，**推荐无占位走 stdin** 如 `codex exec -s read-only -`；`{text}`=prompt 独立 argv（Windows 下仅纯 ASCII）；`{file}`=临时文件）· 裸模型名（=api:，模型可由 `XTEAM_LLM_MODEL` 兜底）。复杂命令包一层 `.bat`/`.sh` 再指向它。
 
 ## 关键规则 / Key rules
 

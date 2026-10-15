@@ -48,7 +48,7 @@ After installing it, you don't need to do anything — it automatically activate
 | 🧭 **结尾自动简报 Auto briefing** | 底部状态栏每轮回复后刷新一行简报。A statusLine refreshes a one-line summary after every reply. |
 | 🚨 **冲突自动警告 Conflict warning** | 编辑被他人占用的文件前，PreToolUse hook 自动弹 `[xteam] 冲突`。Warns before you edit a file someone else holds. |
 | 🤝 **Codex/GPT 协作 Codex/GPT collab** | 先锁路径再派 Codex，Claude 指挥、Codex 落盘。Lock paths first, then delegate — Claude directs, Codex writes. |
-| 🌉 **跨模型桥 Cross-model bridge** | `ask` 单次咨询任意模型 / `bridge` 让 codex、cursor 等外部 agent 驻场进群聊：@它必回，群聊即共享记忆，多 agent 多模型实时协作。Ask any model once, or make codex/cursor a resident chat agent — `@name` mentions get replies; the chat itself is the shared memory. |
+| 🌉 **跨模型桥 Cross-model bridge** | `ask` 单次咨询任意模型 / `bridge` 让 codex（GPT）驻场进群聊：@它必回，群聊即共享记忆，Claude × GPT 多模型实时协作。Ask any model once, or make codex a resident chat agent — `@name` mentions get replies; the chat itself is the shared memory. |
 | 🌍 **跨平台 Cross-platform** | Windows / macOS / Linux，纯 Node 内置模块，零第三方依赖。Pure Node builtins, zero deps. |
 | 🪶 **省 token Token-lean** | 状态只输出摘要 + 最近几条聊天，不会 `cat` 整个日志。Summaries only, never dumps the log. |
 
@@ -245,8 +245,8 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 
 ### 跨模型 Cross-model（`ask` · `bridge`）
 
-模型 spec：`api:<model>`（OpenAI 兼容口）· `cli:<name>`（任意本地 CLI，如 codex/cursor-agent）· 裸模型名（=api:）。
-*Model spec: `api:<model>` (OpenAI-compatible) · `cli:<name>` (any local CLI like codex/cursor-agent) · bare name (=api:).*
+模型 spec：`api:<model>`（OpenAI 兼容口）· `cli:<name>`（任意本地 CLI，主打 `codex`）· 裸模型名（=api:）。
+*Model spec: `api:<model>` (OpenAI-compatible) · `cli:<name>` (any local CLI, mainly `codex`) · bare name (=api:).*
 
 ```bash
 # api 后端 / api backend
@@ -255,8 +255,8 @@ export XTEAM_LLM_API_KEY=sk-...
 xteam ask -m api:gpt-5.5 "这个失败路径成立吗？"
 xteam ask --say -m api:gpt-5.5 "..."        # 问答贴进群聊，所有会话可见
 
-# cli 后端 / cli backend —— {text}=prompt 作独立 argv（不经 shell，安全），{file}=临时文件；无占位走 stdin
-export XTEAM_CLI_CODEX="codex exec --full-auto {text}"
+# cli 后端 / cli backend —— {text}=prompt 作独立 argv，{file}=临时文件；无占位走 stdin（推荐）
+export XTEAM_CLI_CODEX="codex exec -s read-only -"   # 末尾 "-" 从 stdin 读 prompt：argv 全固定、零转义、中文安全
 xteam ask -m cli:codex "帮我评估这段协议设计"
 
 # 驻场桥 / resident bridge —— 群聊即共享记忆：未读喂给 agent、回复贴回群聊

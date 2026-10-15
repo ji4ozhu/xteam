@@ -50,6 +50,20 @@ const PRESENCE = path.join(COORD, 'presence');
 const WAITERS = path.join(COORD, 'waiters');
 const CHAT = path.join(COORD, 'chat.log');
 
+// 身份来源：'env'/'session' 唯一可信；'git' fallback 可能被多个无 session 进程共享（撞车）。
+function ownerSource() {
+  if (process.env.XTEAM_OWNER) return 'env';
+  if (process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID) return 'session';
+  try {
+    const n = execSync('git config user.name', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (n) return 'git';
+  } catch {}
+  return 'none';
+}
+
 function owner() {
   if (process.env.XTEAM_OWNER) return process.env.XTEAM_OWNER;
   const sid = process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID;
@@ -76,8 +90,13 @@ function normalize(p) {
   return p;
 }
 
+// Windows 路径不区分大小写：做 key 时归一，避免 "A.txt"/"a.txt" 被算成两把锁。
+function lockKey(p) {
+  return process.platform === 'win32' ? String(p).toLowerCase() : String(p);
+}
+
 function lockDir(p) {
-  const h = createHash('sha1').update(p).digest('hex');
+  const h = createHash('sha1').update(lockKey(p)).digest('hex');
   return path.join(LOCKS, h);
 }
 
@@ -194,7 +213,9 @@ function preedit() {
   if (!h) return;
   const m = readMeta(h.key);
   const who = m && m.owner ? m.owner : '?';
-  if (who === owner()) return;
+  // git fallback 身份不放行"自己"的锁：同 user.name 的多个无 session 进程会撞成同一 owner，
+  // 静默放行等于防冲突失效。宁可让同名本人看到一次误报警告。
+  if (who === owner() && ownerSource() !== 'git') return;
   const note = m && m.note ? ` — ${m.note}` : '';
   console.error(`[xteam] 冲突/conflict: ${p} 正被 held by ${displayName(who)}${note}。请勿修改此文件——去改别的文件，或先协调（xteam status 看锁/群聊）。Do NOT edit — switch to another file or coordinate first (xteam status).`);
 }
@@ -203,12 +224,20 @@ function acquire(p, opts) {
   p = normalize(p);
   registerPresence();
   if (opts.label) applyLabel(owner(), opts.label);
+  if (ownerSource() === 'git') {
+    console.log(`  [warn] 当前身份来自 git user.name（非会话唯一），同名多进程会撞车——建议设 XTEAM_OWNER / identity from git user.name; set XTEAM_OWNER to stay unique.`);
+  }
   const key = lockDir(p);
   fs.mkdirSync(LOCKS, { recursive: true });
   try {
     fs.mkdirSync(key);
   } catch (e) {
     if (e.code === 'EEXIST') {
+      const m = readMeta(key);
+      if (m && m.owner === owner()) {
+        console.log(`ALREADY HELD BY YOU: ${p}  / 这把锁就是你自己的，无需重复加锁`);
+        return;
+      }
       report(p, key);
       return;
     }
@@ -220,10 +249,19 @@ function acquire(p, opts) {
   console.log(`ACQUIRED: ${p} (owner=${displayName(meta.owner)})  / 已加锁`);
 }
 
-function release(p) {
+function release(p, opts) {
   p = normalize(p);
   const key = lockDir(p);
   if (fs.existsSync(key)) {
+    const m = readMeta(key);
+    const who = m && m.owner ? m.owner : '?';
+    // P0 防护：只允许放自己的锁，--force 是显式逃生口。否则任何会话一声 release
+    // 就能抹掉别人的锁，防冲突承诺失效。
+    if (who !== owner() && !(opts && opts.force)) {
+      console.log(`REFUSED: ${p} — 这把锁属于 ${displayName(who)}，你无权释放 / not your lock.`);
+      console.log('  确需强制释放用 xteam release <path> --force（先在群聊协调）/ force with --force (coordinate in chat first).');
+      return;
+    }
     fs.rmSync(key, { recursive: true, force: true });
     console.log(`RELEASED: ${p}  / 已放锁`);
     const queue = listWaiters(p).filter((w) => w.owner !== owner());
@@ -267,7 +305,7 @@ function heartbeat(p) {
 }
 
 function waiterDir(p, who) {
-  const h = createHash('sha1').update(`${p} ${who}`).digest('hex');
+  const h = createHash('sha1').update(`${lockKey(p)} ${who}`).digest('hex');
   return path.join(WAITERS, h);
 }
 function addWaiter(p, who, note) {
@@ -645,13 +683,36 @@ function llmCliCall(name, prompt, timeoutSec) {
     }
     const exe = args.shift();
     if (!exe) throw new Error(`${key} 模板为空`);
-    const r = spawnSync(exe, args, {
+    // Windows：npm 装的 CLI 是 .cmd shim，必须经 shell 才能 spawn。shell 会重拼命令行，
+    // {text} 自由文本仅纯 ASCII 且不含 % 时安全（cmd 展开 %VAR%，ANSI codepage 会弄坏中文）；
+    // 否则请改用 {file} 或 stdin 模板（推荐 `codex exec -s read-only -`，argv 全固定零转义）。
+    const needShell = process.platform === 'win32';
+    if (needShell && !useStdin && (/[^\x00-\x7F]|%/.test(prompt))) {
+      throw new Error(`${key}: Windows 下 {text} 只支持纯 ASCII 且不含 % 的文本；请改用 {file} 或 stdin 模板（如 codex exec -s read-only -）`);
+    }
+    let r;
+    const spawnOpts = {
       input: useStdin ? prompt : undefined,
       timeout: (timeoutSec || 180) * 1000,
       encoding: 'utf8',
       maxBuffer: 8 * 1024 * 1024,
-    });
-    if (r.error) throw r.error;
+    };
+    if (needShell) {
+      // 单 command 字符串 + shell，args 此时只含模板固定 token（prompt 走 stdin/{file} 或已限制 ASCII），
+      // 逐个引号后拼接；避开 DEP0190（args 数组 + shell 只拼接不转义）。
+      const cmdLine = [exe, ...args]
+        .map((a) => (/[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
+        .join(' ');
+      r = spawnSync(cmdLine, { ...spawnOpts, shell: true });
+    } else {
+      r = spawnSync(exe, args, spawnOpts);
+    }
+    if (r.error) {
+      if (r.error.code === 'ENOENT') {
+        throw new Error(`${key}: 找不到命令 "${exe}"（模板首词须是 PATH 里的命令名或可执行文件绝对路径）`);
+      }
+      throw r.error;
+    }
     if (r.status !== 0) {
       throw new Error(`${key} exit ${r.status}${r.stderr ? ': ' + String(r.stderr).slice(0, 200) : ''}`);
     }
@@ -742,6 +803,14 @@ async function bridgeCmd(args, opts) {
     }
     saveBridgeState(name, { seen: [...seen] });
   };
+
+  // 启动基线：历史消息一律视为已读，只处理启动后的新消息——否则会把几天前的 @ 当新问题回。
+  if (fs.existsSync(CHAT)) {
+    for (const line of fs.readFileSync(CHAT, 'utf8').split('\n').filter(Boolean)) {
+      seen.add(sha1(line));
+    }
+    saveBridgeState(name, { seen: [...seen] });
+  }
 
   console.log(`BRIDGE: @${name} 驻场中 (model=${spec || process.env.XTEAM_LLM_MODEL || '?'}, digest=${digestOn ? interval + 's' : 'off'}, Ctrl+C 退出)`);
   say(`[bridge] @${name} 驻场（跨模型桥，@${name} 提问必回）`, { owner: me });
@@ -975,8 +1044,8 @@ Wait / 等锁:      轮询 ${WAIT_POLL}s (XTEAM_WAIT_POLL)，上限 ${WAIT_MAX}s
   spec = api:<model> | cli:<name> | <model>(=api:)   默认取 XTEAM_LLM_MODEL
   api:  XTEAM_LLM_API_BASE (default https://api.openai.com/v1, OpenAI 兼容口均可)
         XTEAM_LLM_API_KEY  (必设)
-  cli:  XTEAM_CLI_<NAME> = 命令模板，如 XTEAM_CLI_CODEX="codex exec --full-auto {text}"
-        {text}=prompt 作独立 argv（不经 shell）；{file}=临时文件路径；无占位走 stdin
+  cli:  XTEAM_CLI_<NAME> = 命令模板，推荐 stdin 形式如 XTEAM_CLI_CODEX="codex exec -s read-only -"
+        {text}=prompt 作独立 argv（Windows 下仅纯 ASCII 且不含 %）；{file}=临时文件；无占位走 stdin
         复杂命令请包一层 .bat/.sh 再指向它
   bridge: 群聊即共享记忆 —— 未读喂给 agent、回复贴回群聊；@<name> 必回，
           默认每 <interval>s 汇总未读征求意见（无贡献则 (silent)），--no-digest 只回 @
@@ -1004,15 +1073,16 @@ async function main() {
     else if ((rest[i] === '--model' || rest[i] === '-m') && rest[i + 1]) { opts.model = rest[i + 1]; i++; }
     else if (rest[i] === '--say') { opts.say = true; }
     else if (rest[i] === '--name' && rest[i + 1]) { opts.name = rest[i + 1]; i++; }
-    else if (rest[i] === '--interval' && rest[i + 1]) { opts.interval = Number(rest[i + 1]); i++; }
-    else if (rest[i] === '--timeout' && rest[i + 1]) { opts.timeout = Number(rest[i + 1]); i++; }
+    else if (rest[i] === '--interval' && rest[i + 1]) { opts.interval = Number(rest[i + 1]) || null; i++; }
+    else if (rest[i] === '--timeout' && rest[i + 1]) { opts.timeout = Number(rest[i + 1]) || null; i++; }
     else if (rest[i] === '--no-digest') { opts.noDigest = true; }
+    else if (rest[i] === '--force') { opts.force = true; }
     else pos.push(rest[i]);
   }
   switch (cmd) {
     case 'check': return check(pos[0] || '');
     case 'acquire': return acquire(pos[0] || '', opts);
-    case 'release': return opts.all ? releaseAll() : release(pos[0] || '');
+    case 'release': return opts.all ? releaseAll() : release(pos[0] || '', opts);
     case 'wait': return wait(pos[0] || '', opts);
     case 'heartbeat': return heartbeat(pos[0] || '');
     case 'takeover': return takeover(pos[0] || '', opts);
