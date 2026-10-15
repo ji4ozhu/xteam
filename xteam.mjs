@@ -97,6 +97,12 @@ const MSG = {
   wake_online: ['在线：{names}', 'online: {names}'],
   wake_idle: ['长时间无响应：{names}', 'unresponsive: {names}'],
   wake_none: ['（暂无其他在线会话）', '(no other sessions online)'],
+  models_cli: ['CLI 路由（XTEAM_CLI_*）', 'CLI routes (XTEAM_CLI_*)'],
+  models_api: ['API 模型（{base}）', 'API models ({base})'],
+  models_default: ['默认 spec: {spec}', 'default spec: {spec}'],
+  models_none: ['（无）', '(none)'],
+  models_api_fail: ['API 枚举失败: {reason}', 'API listing failed: {reason}'],
+  models_hint: ['cli 后端的模型由各 CLI 自己决定（codex：模板里 -m <model> 指定）', 'cli backend models depend on the CLI itself (codex: -m <model> in the template)'],
 };
 const MSG_KEYS = Object.keys(MSG);
 function msgEnTable() {
@@ -1043,6 +1049,60 @@ async function wakeCmd(opts) {
   }
 }
 
+// ——— models：枚举当前可用的模型 ———
+// 来源三路：XTEAM_CLI_* 注册的路由 / api 后端 GET /models（OpenAI 兼容口大多支持）/ 默认 spec。
+async function modelsCmd() {
+  console.log('xteam models:');
+  // 1) cli routes
+  const routes = Object.keys(process.env)
+    .filter((k) => k.startsWith('XTEAM_CLI_') && process.env[k])
+    .sort()
+    .map((k) => ({ spec: 'cli:' + k.slice('XTEAM_CLI_'.length).toLowerCase(), tpl: process.env[k] }));
+  console.log(`  ${t('models_cli')}`);
+  if (routes.length) {
+    for (const r of routes) console.log(`    ${r.spec}   ← ${r.tpl}`);
+  } else {
+    console.log(`    ${t('models_none')}`);
+  }
+  // 2) api models
+  const base = (process.env.XTEAM_LLM_API_BASE || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  const key = process.env.XTEAM_LLM_API_KEY;
+  console.log(`  ${t('models_api', { base })}`);
+  if (!key) {
+    console.log(`    ${t('models_api_fail', { reason: 'XTEAM_LLM_API_KEY 未设置' })}`);
+  } else {
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 15000);
+      const res = await fetch(`${base}/models`, {
+        headers: { authorization: `Bearer ${key}` },
+        signal: ac.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        console.log(`    ${t('models_api_fail', { reason: 'HTTP ' + res.status })}`);
+      } else {
+        const j = await res.json();
+        const ids = (Array.isArray(j.data) ? j.data : Array.isArray(j.models) ? j.models : [])
+          .map((m) => (m && (m.id || m.name)) || null)
+          .filter(Boolean)
+          .sort();
+        if (ids.length) {
+          for (const id of ids) console.log(`    ${id}`);
+        } else {
+          console.log(`    ${t('models_none')}`);
+        }
+      }
+    } catch (e) {
+      console.log(`    ${t('models_api_fail', { reason: e.message })}`);
+    }
+  }
+  // 3) default + hint
+  const dflt = process.env.XTEAM_LLM_MODEL;
+  console.log(`  ${t('models_default', { spec: dflt || t('models_none') })}`);
+  console.log(`  ${t('models_hint')}`);
+}
+
 // ——— version & self-update ———
 async function download(rel) {
   const res = await fetch(`${REPO_RAW}/${rel}`);
@@ -1224,6 +1284,7 @@ Commands / 子命令:
   xteam label <名称>                 给本会话起名(显示为 <id>-<名称>) / name this session
   xteam say <message> [--label L]    发到群聊 / post to group chat
   xteam ask [--say] [-m <spec>] <prompt>   单次跨模型咨询 / ask another model once
+  xteam models                           枚举当前可用模型（cli 路由 + api /models）/ list available models
   xteam bridge --name <n> -m <spec> [--interval <s>] [--no-digest]
                                        驻场跨模型 agent 进群聊（@<n> 必回）/ resident cross-model agent
   xteam wake [--interval <s>]         定时 @全体 进展检查（默认 180s，防挂死）/ periodic @all status check
@@ -1295,6 +1356,7 @@ async function main() {
     case 'chat': return say(pos.join(' '), opts);
     case 'ask': return await askCmd(pos, opts);
     case 'bridge': return await bridgeCmd(pos, opts);
+    case 'models': return await modelsCmd();
     case 'wake': return await wakeCmd(opts);
     case 'i18n-gen': return await i18nGen(pos[0] || detectLang());
     case 'tail': return tailCmd(pos[0]);
