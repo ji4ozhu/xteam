@@ -267,6 +267,15 @@ xteam bridge --name gpt -m api:gpt-5.5 --no-digest   # 显示名 gpt-5.5-gpt，�
 
 为什么用群聊桥而不是直接派长任务：外部 agent 无状态也没关系——**记忆由 chat.log 承载**，每轮把未读喂给它即可；一问一答秒级返回，没有长会话的超时/无响应问题。复杂命令请包一层 `.bat`/`.sh` 再指向它。
 
+### 多语言 i18n
+
+输出语言跟随系统 locale（`zh`/`en` 内置中英模板，零依赖）；其他语言（ja/de/fr/...）**首次使用时自动调一次 AI 翻译**并落盘 `i18n/<lang>.json`，之后直接读缓存——**源模板不变就永不重翻，不浪费 token**。翻译不可用（没配 LLM）自动回退英文（ASCII 安全，非中文终端不乱码）。
+
+- `XTEAM_LANG=en` 显式指定语言（覆盖系统 locale）
+- 自动翻译需要 `XTEAM_LLM_MODEL`（如 `api:gpt-5.5`）或 `XTEAM_CLI_<NAME>` 任一配置（与 ask/bridge 同一套后端）
+- `help` 命令文档与群聊消息内容不翻译（命令名翻坏会出事）
+*Output language follows the OS locale; zh/en are built-in. Other languages are AI-translated ONCE on first use, cached in `i18n/<lang>.json` with a source hash — never re-translated unless the template changes.*
+
 ### 铁律 Protocol（改文件 / 派 Codex 前）before editing / delegating
 
 1. **查 check** `xteam check <path>` → 输出 `FREE` 才能动 *only touch if it says `FREE`*

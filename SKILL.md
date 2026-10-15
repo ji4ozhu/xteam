@@ -127,6 +127,8 @@ Xteam: actor.rs 等待超时，持有者 e193b67b 仍活跃（idle 3m）。
 
 model spec：`api:<model>`（OpenAI 兼容口，需 `XTEAM_LLM_API_BASE` + `XTEAM_LLM_API_KEY`）· `cli:<name>`（需 `XTEAM_CLI_<NAME>` 命令模板，**推荐无占位走 stdin** 如 `codex exec -s read-only -`；`{text}`=prompt 独立 argv（Windows 下仅纯 ASCII）；`{file}`=临时文件）· 裸模型名（=api:，模型可由 `XTEAM_LLM_MODEL` 兜底）。复杂命令包一层 `.bat`/`.sh` 再指向它。
 
+**多语言 i18n**：输出语言跟随系统 locale（zh/en 内置）；其他语言首次使用时自动调一次 AI 翻译落盘 `i18n/<lang>.json`（带源 hash，模板不变永不重翻），无 LLM 配置回退英文。`XTEAM_LANG=<lang>` 显式覆盖。
+
 ## 关键规则 / Key rules
 
 - **默认启用，零配置 / enabled by default, zero config**：会话启动时 SessionStart hook 自动跑 `xteam status` 输出当前所有会话状态；底部状态栏每轮回复后刷新一行简报。无需手动输入 `/xteam`。

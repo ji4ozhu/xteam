@@ -29,6 +29,153 @@ const STATUS_CHAT = Number(process.env.XTEAM_STATUS_CHAT || 5);  // chat lines i
 const WAIT_POLL = Number(process.env.XTEAM_WAIT_POLL || 5);      // seconds between wait polls
 const WAIT_MAX = Number(process.env.XTEAM_WAIT_MAX || 900);      // max seconds for `wait`
 
+// ——— i18n：按系统语言渲染输出 ———
+// 内置中英默认模板（无 AI 也完整可用）；其他语言首次使用时调 LLM 翻译一次，
+// 结果带 sourceHash 落盘 i18n/<lang>.json —— 源模板不变就永不再翻（省 token）。
+// XTEAM_LANG 显式覆盖；help 文档与群聊消息内容不翻译（命令名翻坏会出事）。
+const MSG = {
+  acquired: ['已加锁', 'acquired'],
+  released: ['已放锁', 'released'],
+  not_held: ['未占用', 'not held'],
+  already_held_by_you: ['这把锁就是你自己的，无需重复加锁', 'already held by you, no need to re-acquire'],
+  refused_not_yours: ['REFUSED: {path} — 这把锁属于 {owner}，你无权释放', 'REFUSED: {path} — this lock belongs to {owner}, not yours to release'],
+  refused_force_hint: ['  确需强制释放用 xteam release <path> --force（先在群聊协调）', '  force with: xteam release <path> --force (coordinate in chat first)'],
+  free: ['FREE: {path}   (可编辑)', 'FREE: {path}   (safe to edit)'],
+  free_no_wait: ['FREE: {path}   (无需等待)', 'FREE: {path}   (no wait needed)'],
+  held_head: ['HELD: {via}', 'HELD: {via}'],
+  held_owner: ['owner={owner}, idle={idle}s', 'owner={owner}, idle={idle}s'],
+  held_tag_orphaned: [' (无主/ORPHANED)', ' (ORPHANED)'],
+  held_tag_gone: [' (会话已退出/session gone)', ' (session gone)'],
+  held_note: [' — {note}', ' — {note}'],
+  queue_waiting: ['  队列: {names}', '  waiting: {names}'],
+  hint_takeover_safe: ['  持有者会话已消失，可安全接管：', '  owner session is gone — safe to take over:'],
+  hint_owner_alive: ['  持有者仍在线（可能正在长时间落盘）。别抢 —— 后台 xteam wait {path} 排队', '  owner is ALIVE (maybe a long write). Don\'t take it; queue with: xteam wait {path}'],
+  hint_gone_wait: ['  持有者会话已退出但锁未过期，{in} 后可接管；或后台 xteam wait {path} 自动接手', '  session gone; takeover in {in}, or queue with: xteam wait {path}'],
+  warn_git_identity: ['  [warn] 当前身份来自 git user.name（非会话唯一），同名多进程会撞车——建议设 XTEAM_OWNER', '  [warn] identity from git user.name (not session-unique); set XTEAM_OWNER to stay unique'],
+  waiting_on: ['WAITING: {path} — 被 {owner} 锁着', 'WAITING: {path} — held by {owner}'],
+  polling: ['  轮询中，每 {poll}s 一次，最多 {max}s', '  polling every {poll}s, up to {max}s'],
+  freed: ['FREED: {path} — 锁已释放，正在接手', 'FREED: {path} — released, acquiring now'],
+  orphaned_notice: ['ORPHANED: {path} — 持有者 {owner} 的会话已消失 (idle={idle}s)', 'ORPHANED: {path} — owner {owner} session is gone (idle={idle}s)'],
+  safe_takeover_cmd: ['  可安全接管：xteam takeover {path}', '  safe to take over: xteam takeover {path}'],
+  timeout_still_held: ['TIMEOUT: {path} 仍被 {owner} 锁着 (等了 {max}s)', 'TIMEOUT: {path} still held by {owner} after {max}s'],
+  waiter_kept: ['  等待登记已保留，可再次 xteam wait {path}', '  waiter entry kept; run xteam wait {path} again'],
+  takeover_alive: ['takeover 拒绝：持有者会话仍在线（idle={idle}s）。长时间落盘也会这样——别抢。', 'takeover refused: owner session is still ALIVE. A long write looks like this too — don\'t steal it.'],
+  takeover_alive_hint: ['  先 xteam say 问一句，或后台 xteam wait {path} 排队', '  ask via xteam say, or queue with: xteam wait {path}'],
+  takeover_notyet: ['takeover 拒绝：持有者会话已退出，但锁还有 {in} 才过期', 'takeover refused: owner gone but lock not expired for {in}'],
+  takeover_notyet_hint: ['  后台 xteam wait {path} 会在到期后自动提示接管', '  background xteam wait {path} will tell you when it\'s takeable'],
+  takeover_cleared: ['takeover: 持有者会话已消失，清除无主锁 {path}', 'takeover: cleared orphaned lock {path} (owner session gone)'],
+  release_all_none: ['NOT HELD: 本会话没有持有任何锁', 'NOT HELD: you hold no locks'],
+  released_all: ['RELEASED ALL: {n} 个锁已放', 'RELEASED ALL: released {n} lock(s)'],
+  waiting_count: ['  -> {n} 个会话在等这把锁: {names}', '  -> {n} session(s) waiting: {names}'],
+  notified_chat: ['  已在群聊 @ 通知', '  notified them in chat'],
+  heartbeated: ['HEARTBEAT: {path}  / 已续期', 'HEARTBEAT: {path}  / refreshed'],
+  preedit_conflict: ['[xteam] 冲突/conflict: {path} 正被 {owner} 持有{note}。请勿修改此文件——去改别的文件，或先协调（xteam status 看锁/群聊）。', '[xteam] CONFLICT: {path} is held by {owner}{note}. Do NOT edit — switch to another file or coordinate first (xteam status).'],
+  st_sessions: ['会话', 'sessions'],
+  st_locks: ['锁', 'locks'],
+  st_chat: ['聊天', 'chat'],
+  st_you: ['[you]', '[you]'],
+  st_holding: ['占用', 'holding'],
+  st_waiting_on: ['在等', 'waiting on'],
+  st_none: ['-', '-'],
+  st_orphaned_tag: [' (无主，可接管)', ' (ORPHANED, safe to take over)'],
+  st_gone_tag: [' (会话已退出)', ' (session gone)'],
+  st_must_lock: ['  【铁律】编辑任何文件前先 xteam acquire <path> 加锁；改完 xteam release；进度 xteam say。没锁就编辑 = 裸奔。', '  [MUST] Lock before editing: xteam acquire <path>; release when done; post progress via xteam say.'],
+  st_orphans_hint: ['  -> {n} 个无主锁（持有者会话已消失），可 xteam takeover 接管', '  -> {n} orphaned lock(s), safe to take over:'],
+  st_released_you: ['已放锁，{names} 可以上了', 'released, {names} you\'re clear to go'],
+  st_waiting_you: ['我在等 {path} 的锁{note}，你放锁后我立刻接手', 'waiting on {path}{note}, will take it the moment you release'],
+  st_other_sessions: ['  -> 现场还有 {n} 个会话: {names}', '  -> {n} other session(s) here: {names}'],
+  st_reach_out: ['    相关就 xteam say 接洽，别重复做', '    if related, reach out via xteam say rather than duplicating'],
+  st_no_locks: ['  -> 无锁，可自由编辑。协议: check -> acquire -> edit -> release', '  -> no locks, safe to edit. protocol: check -> acquire -> edit -> release'],
+  st_waiting_you_queued: ['  -> 你在等 {paths}；用 xteam wait <path> 阻塞等待并自动接手', '  -> you\'re queued for {paths}; xteam wait <path> auto-acquires on release'],
+  bridge_parked: ['[bridge] @{me} 驻场（跨模型桥，@{me} 或 @{name} 提问必回，模型 {model}）', '[bridge] @{me} parked (cross-model bridge; @{me} or @{name} mentions get replies; model {model})'],
+  sl_head: ['xteam {a}会话·{l}锁·聊{c}', 'xteam {a}sessions·{l}locks·chat{c}'],
+  sl_mine_locks: ['我锁{n}', 'I hold {n}'],
+  sl_no_locks: ['我无锁', 'I hold none'],
+  sl_orphans: ['无主{n}', '{n} orphaned'],
+  sl_others: ['{n}会话在跑', '{n} sessions running'],
+};
+const MSG_KEYS = Object.keys(MSG);
+function msgEnTable() {
+  const o = {};
+  for (const k of MSG_KEYS) o[k] = MSG[k][1];
+  return o;
+}
+
+let _lang = null;
+function detectLang() {
+  if (_lang) return _lang;
+  const raw = (process.env.XTEAM_LANG || Intl.DateTimeFormat().resolvedOptions().locale || 'en').toLowerCase();
+  _lang = raw.split(/[-_]/)[0] || 'en';
+  return _lang;
+}
+
+function fmtMsg(s, vars) {
+  return String(s).replace(/\{(\w+)\}/g, (m, k) => (vars && vars[k] !== undefined ? String(vars[k]) : m));
+}
+
+function i18nPackPath(lang) {
+  return path.join(SELF_DIR, 'i18n', `${lang}.json`);
+}
+
+// 缓存命中则零成本；未命中同步派生子进程翻译（子进程内可 async 调 api/cli 后端）。
+// sourceHash 锁定源模板：模板不变永不重翻；翻译不可用时回退英文（ASCII 安全）。
+function ensurePack(lang) {
+  const file = i18nPackPath(lang);
+  const srcHash = createHash('sha1').update(JSON.stringify(msgEnTable())).digest('hex').slice(0, 16);
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (j && j.sourceHash === srcHash && j.strings && typeof j.strings === 'object') return j.strings;
+  } catch {}
+  try {
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), 'i18n-gen', lang], {
+      encoding: 'utf8', timeout: 180 * 1000, stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    if (r.status === 0) {
+      const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (j && j.sourceHash === srcHash && j.strings) return j.strings;
+    }
+  } catch {}
+  return null; // 回退英文
+}
+
+function t(key, vars) {
+  const lang = detectLang();
+  const entry = MSG[key];
+  if (!entry) return fmtMsg(key, vars);
+  if (lang === 'zh') return fmtMsg(entry[0], vars);
+  if (lang === 'en') return fmtMsg(entry[1], vars);
+  const pack = ensurePack(lang);
+  return fmtMsg((pack && pack[key]) || entry[1], vars);
+}
+
+// 内部命令：翻译 MSG 英文源到目标语言并落盘（ask/bridge 同一套 LLM 后端）。
+// 要求 XTEAM_LLM_MODEL 或 XTEAM_CLI_<NAME> 任一可用；都不配则 exit 1（父进程回退英文）。
+async function i18nGen(lang) {
+  const en = msgEnTable();
+  const prompt = `You are a software localization expert. Translate the JSON values into ${lang}. ` +
+    `Keep keys and {placeholders} unchanged. Output ONLY a JSON object (same keys). ` +
+    `Style: terse CLI status lines. Input:\n${JSON.stringify(en)}`;
+  let spec = process.env.XTEAM_LLM_MODEL || null;
+  if (!spec) {
+    const cliKey = Object.keys(process.env).find((k) => k.startsWith('XTEAM_CLI_'));
+    if (cliKey) spec = 'cli:' + cliKey.slice('XTEAM_CLI_'.length).toLowerCase();
+  }
+  if (!spec && process.env.XTEAM_LLM_API_KEY) spec = 'api:gpt-4o-mini';
+  if (!spec) {
+    console.error('i18n-gen: 需要 XTEAM_LLM_MODEL 或 XTEAM_CLI_* 配置才能翻译');
+    process.exit(1);
+  }
+  const out = await llmCall(spec, prompt, 150);
+  const m = out.match(/\{[\s\S]*\}/);
+  if (!m) { console.error('i18n-gen: 翻译输出不是 JSON'); process.exit(1); }
+  const strings = JSON.parse(m[0]);
+  const srcHash = createHash('sha1').update(JSON.stringify(en)).digest('hex').slice(0, 16);
+  const file = i18nPackPath(lang);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ lang, sourceHash: srcHash, model: spec, strings }, null, 2) + '\n');
+  console.log(`i18n-gen: ${lang} -> ${file} (${MSG_KEYS.length} strings)`);
+}
+
 function nowSec() { return Math.floor(Date.now() / 1000); }
 
 function repoRoot() {
@@ -147,11 +294,11 @@ function registerPresence() {
   const who = owner();
   fs.mkdirSync(PRESENCE, { recursive: true });
   const key = presenceDir(who);
-  const t = nowSec();
+  const t0 = nowSec();
   let m = readMeta(key);
-  if (!m) m = { owner: who, startedAt: t };
+  if (!m) m = { owner: who, startedAt: t0 };
   if (!m.label && process.env.XTEAM_LABEL) m.label = process.env.XTEAM_LABEL;
-  m.lastSeenAt = t;
+  m.lastSeenAt = t0;
   writeMetaAtomic(key, m);
   renewOwnLocks();
   return who;
@@ -162,20 +309,20 @@ function report(p, key, via) {
   const who = m && m.owner ? m.owner : '?';
   const st = m ? lockState(m) : { tag: 'orphaned', idle: 0, alive: false };
   const viaStr = via && via !== p ? ` [via ${via}]` : '';
-  const note = m && m.note ? ` — ${m.note}` : '';
-  const tag = st.tag === 'orphaned' ? ' (ORPHANED/无主)' : st.alive ? '' : ' (会话已退出/session gone)';
-  console.log(`HELD: ${p}${viaStr} — owner=${displayName(who)}, idle=${st.idle}s${tag}${note}`);
+  const note = m && m.note ? t('held_note', { note: m.note }) : '';
+  const tag = st.tag === 'orphaned' ? t('held_tag_orphaned') : st.alive ? '' : t('held_tag_gone');
+  console.log(`${t('held_head', { via: p + viaStr })} — ${t('held_owner', { owner: displayName(who), idle: st.idle })}${tag}${note}`);
   const queue = listWaiters(p);
   if (queue.length) {
-    console.log(`  队列/waiting: ${queue.map((w) => displayName(w.owner)).join(', ')}`);
+    console.log(t('queue_waiting', { names: queue.map((w) => displayName(w.owner)).join(', ') }));
   }
   if (st.tag === 'orphaned') {
-    console.log(`  持有者会话已消失，可安全接管 / owner session is gone — safe to take over:`);
+    console.log(t('hint_takeover_safe'));
     console.log(`    xteam takeover ${p}`);
   } else if (st.alive) {
-    console.log(`  持有者仍在线（可能正在长时间落盘）。别抢 —— 后台 xteam wait ${p} 排队 / owner is ALIVE (maybe a long write). Don't take it; queue with xteam wait.`);
+    console.log(t('hint_owner_alive', { path: p }));
   } else {
-    console.log(`  持有者会话已退出但锁未过期，${fmtIdle(TTL - st.idle)} 后可接管；或后台 xteam wait ${p} 自动接手 / session gone; takeover in ${fmtIdle(TTL - st.idle)}, or queue with xteam wait.`);
+    console.log(t('hint_gone_wait', { in: fmtIdle(TTL - st.idle), path: p }));
   }
 }
 
@@ -195,7 +342,7 @@ function check(p) {
   p = normalize(p);
   const h = findHeld(p);
   if (h) report(p, h.key, h.via);
-  else console.log(`FREE: ${p}   (可编辑 / safe to edit)`);
+  else console.log(t('free', { path: p }));
 }
 
 function preedit() {
@@ -216,8 +363,8 @@ function preedit() {
   // git fallback 身份不放行"自己"的锁：同 user.name 的多个无 session 进程会撞成同一 owner，
   // 静默放行等于防冲突失效。宁可让同名本人看到一次误报警告。
   if (who === owner() && ownerSource() !== 'git') return;
-  const note = m && m.note ? ` — ${m.note}` : '';
-  console.error(`[xteam] 冲突/conflict: ${p} 正被 held by ${displayName(who)}${note}。请勿修改此文件——去改别的文件，或先协调（xteam status 看锁/群聊）。Do NOT edit — switch to another file or coordinate first (xteam status).`);
+  const note = m && m.note ? t('held_note', { note: m.note }) : '';
+  console.error(t('preedit_conflict', { path: p, owner: displayName(who), note }));
 }
 
 function acquire(p, opts) {
@@ -225,7 +372,7 @@ function acquire(p, opts) {
   registerPresence();
   if (opts.label) applyLabel(owner(), opts.label);
   if (ownerSource() === 'git') {
-    console.log(`  [warn] 当前身份来自 git user.name（非会话唯一），同名多进程会撞车——建议设 XTEAM_OWNER / identity from git user.name; set XTEAM_OWNER to stay unique.`);
+    console.log(t('warn_git_identity'));
   }
   const key = lockDir(p);
   fs.mkdirSync(LOCKS, { recursive: true });
@@ -235,7 +382,7 @@ function acquire(p, opts) {
     if (e.code === 'EEXIST') {
       const m = readMeta(key);
       if (m && m.owner === owner()) {
-        console.log(`ALREADY HELD BY YOU: ${p}  / 这把锁就是你自己的，无需重复加锁`);
+        console.log(`ALREADY HELD BY YOU: ${p}  / ${t('already_held_by_you')}`);
         return;
       }
       report(p, key);
@@ -243,10 +390,10 @@ function acquire(p, opts) {
     }
     throw e;
   }
-  const t = nowSec();
-  const meta = { path: p, owner: opts.owner || owner(), note: opts.note || '', acquiredAt: t, heartbeatAt: t };
+  const t0 = nowSec();
+  const meta = { path: p, owner: opts.owner || owner(), note: opts.note || '', acquiredAt: t0, heartbeatAt: t0 };
   writeMetaAtomic(key, meta);
-  console.log(`ACQUIRED: ${p} (owner=${displayName(meta.owner)})  / 已加锁`);
+  console.log(`ACQUIRED: ${p} (owner=${displayName(meta.owner)})  / ${t('acquired')}`);
 }
 
 function release(p, opts) {
@@ -258,21 +405,21 @@ function release(p, opts) {
     // P0 防护：只允许放自己的锁，--force 是显式逃生口。否则任何会话一声 release
     // 就能抹掉别人的锁，防冲突承诺失效。
     if (who !== owner() && !(opts && opts.force)) {
-      console.log(`REFUSED: ${p} — 这把锁属于 ${displayName(who)}，你无权释放 / not your lock.`);
-      console.log('  确需强制释放用 xteam release <path> --force（先在群聊协调）/ force with --force (coordinate in chat first).');
+      console.log(t('refused_not_yours', { path: p, owner: displayName(who) }));
+      console.log(t('refused_force_hint'));
       return;
     }
     fs.rmSync(key, { recursive: true, force: true });
-    console.log(`RELEASED: ${p}  / 已放锁`);
+    console.log(`RELEASED: ${p}  / ${t('released')}`);
     const queue = listWaiters(p).filter((w) => w.owner !== owner());
     if (queue.length) {
       const names = queue.map((w) => displayName(w.owner));
-      console.log(`  -> ${queue.length} 个会话在等这把锁 / ${queue.length} session(s) waiting: ${names.join(', ')}`);
-      say(`${p} 已放锁，${names.map((n) => `@${n}`).join(' ')} 可以上了 / released ${p}, you're clear to go`, {});
-      console.log(`  已在群聊 @ 通知 / notified them in chat`);
+      console.log(t('waiting_count', { n: queue.length, names: names.join(', ') }));
+      say(`${p} ${t('st_released_you', { names: names.map((n) => `@${n}`).join(' ') })}`, {});
+      console.log(t('notified_chat'));
     }
   } else {
-    console.log(`NOT HELD: ${p}  / 未占用`);
+    console.log(`NOT HELD: ${p}  / ${t('not_held')}`);
   }
 }
 
@@ -284,11 +431,11 @@ function releaseAll() {
     if (m && m.owner === me) mine.push(m.path);
   }
   if (!mine.length) {
-    console.log('NOT HELD: 本会话没有持有任何锁 / you hold no locks.');
+    console.log(t('release_all_none'));
     return;
   }
   for (const p of mine) release(p);
-  console.log(`RELEASED ALL: ${mine.length} 个锁已放 / released ${mine.length} lock(s).`);
+  console.log(t('released_all', { n: mine.length }));
 }
 
 function heartbeat(p) {
@@ -301,7 +448,7 @@ function heartbeat(p) {
   }
   m.heartbeatAt = nowSec();
   writeMetaAtomic(key, m);
-  console.log(`HEARTBEAT: ${p}  / 已续期`);
+  console.log(t('heartbeated', { path: p }));
 }
 
 function waiterDir(p, who) {
@@ -310,8 +457,8 @@ function waiterDir(p, who) {
 }
 function addWaiter(p, who, note) {
   const key = waiterDir(p, who);
-  const t = nowSec();
-  writeMetaAtomic(key, { path: p, owner: who, note: note || '', since: t, heartbeatAt: t });
+  const t0 = nowSec();
+  writeMetaAtomic(key, { path: p, owner: who, note: note || '', since: t0, heartbeatAt: t0 });
 }
 function dropWaiter(p, who) {
   fs.rmSync(waiterDir(p, who), { recursive: true, force: true });
@@ -340,16 +487,16 @@ function wait(p, opts) {
 
   const held = findHeld(p);
   if (!held) {
-    console.log(`FREE: ${p}   (无需等待 / no wait needed)`);
+    console.log(t('free_no_wait', { path: p }));
     return acquire(p, opts);
   }
 
   addWaiter(p, me, opts.note);
   const m = readMeta(held.key);
   const blocker = m && m.owner ? m.owner : '?';
-  console.log(`WAITING: ${p} — 被 ${displayName(blocker)} 锁着 / held by ${displayName(blocker)}`);
-  say(`@${displayName(blocker)} 我在等 ${p} 的锁${opts.note ? `（${opts.note}）` : ''}，你放锁后我立刻接手 / waiting on ${p}, will take it the moment you release`, { owner: me });
-  console.log(`  轮询中，每 ${WAIT_POLL}s 一次，最多 ${WAIT_MAX}s / polling every ${WAIT_POLL}s, up to ${WAIT_MAX}s`);
+  console.log(t('waiting_on', { path: p, owner: displayName(blocker) }));
+  say(`@${displayName(blocker)} ${t('st_waiting_you', { path: p, note: opts.note ? `（${opts.note}）` : '' })}`, { owner: me });
+  console.log(t('polling', { poll: WAIT_POLL, max: WAIT_MAX }));
 
   const deadline = nowSec() + WAIT_MAX;
   for (;;) {
@@ -357,21 +504,21 @@ function wait(p, opts) {
     const cur = findHeld(p);
     if (!cur) {
       dropWaiter(p, me);
-      console.log(`FREED: ${p} — 锁已释放，正在接手 / released, acquiring now`);
+      console.log(t('freed', { path: p }));
       return acquire(p, opts);
     }
     const cm = readMeta(cur.key);
     const st = cm ? lockState(cm) : { tag: 'orphaned', idle: 0, alive: false };
     if (st.tag === 'orphaned') {
       dropWaiter(p, me);
-      console.log(`ORPHANED: ${p} — 持有者 ${displayName((cm && cm.owner) || '?')} 的会话已消失 (idle=${st.idle}s) / owner session is gone`);
-      console.log(`  可安全接管：xteam takeover ${p} / safe to take over`);
+      console.log(t('orphaned_notice', { path: p, owner: displayName((cm && cm.owner) || '?'), idle: st.idle }));
+      console.log(t('safe_takeover_cmd', { path: p }));
       return;
     }
     addWaiter(p, me, opts.note);   // keep our waiter entry fresh
     if (nowSec() >= deadline) {
-      console.log(`TIMEOUT: ${p} 仍被 ${displayName((cm && cm.owner) || '?')} 锁着 (等了 ${WAIT_MAX}s) / still held after ${WAIT_MAX}s`);
-      console.log(`  等待登记已保留，可再次 xteam wait ${p} / waiter entry kept; run xteam wait again`);
+      console.log(t('timeout_still_held', { path: p, owner: displayName((cm && cm.owner) || '?'), max: WAIT_MAX }));
+      console.log(t('waiter_kept', { path: p }));
       return;
     }
   }
@@ -385,19 +532,18 @@ function takeover(p, opts) {
     const st = lockState(m);
     if (st.alive) {
       report(p, key);
-      console.log(`takeover 拒绝：持有者会话仍在线（idle=${st.idle}s）。长时间落盘也会这样——别抢。`);
-      console.log(`takeover refused: owner session is still ALIVE. A long write looks like this too — don't steal it.`);
-      console.log(`  先 xteam say 问一句，或后台 xteam wait ${p} 排队 / ask via xteam say, or queue with xteam wait.`);
+      console.log(t('takeover_alive', { idle: st.idle }));
+      console.log(t('takeover_alive_hint', { path: p }));
       return;
     }
     if (st.tag !== 'orphaned') {
       report(p, key);
-      console.log(`takeover 拒绝：持有者会话已退出，但锁还有 ${fmtIdle(TTL - st.idle)} 才过期 / owner gone but lock not expired yet.`);
-      console.log(`  后台 xteam wait ${p} 会在到期后自动提示接管 / background xteam wait will tell you when it's takeable.`);
+      console.log(t('takeover_notyet', { in: fmtIdle(TTL - st.idle) }));
+      console.log(t('takeover_notyet_hint', { path: p }));
       return;
     }
     fs.rmSync(key, { recursive: true, force: true });
-    console.log(`takeover: 持有者会话已消失，清除无主锁 ${p} / cleared orphaned lock (owner session gone)`);
+    console.log(t('takeover_cleared', { path: p }));
   }
   acquire(p, opts);
 }
@@ -438,13 +584,13 @@ function lockState(m) {
 // working the protocol keeps your locks alive — no discipline required.
 function renewOwnLocks() {
   const me = owner();
-  const t = nowSec();
+  const t0 = nowSec();
   let n = 0;
   for (const d of fs.existsSync(LOCKS) ? fs.readdirSync(LOCKS) : []) {
     const key = path.join(LOCKS, d);
     const m = readMeta(key);
     if (!m || m.owner !== me) continue;
-    m.heartbeatAt = t;
+    m.heartbeatAt = t0;
     writeMetaAtomic(key, m);
     n++;
   }
@@ -477,48 +623,47 @@ function status() {
   }
   const active = pres.filter((p) => now - (p.lastSeenAt || 0) <= TTL);
 
-  console.log(`xteam: ${active.length} session(s) · ${locks.length} lock(s) · chat ${chat.length}  (${active.length} 会话 · ${locks.length} 锁 · 聊天 ${chat.length})`);
-  console.log(`  【铁律/MUST】编辑任何文件前先 xteam acquire <path> 加锁；改完 xteam release；进度 xteam say。没锁就编辑 = 裸奔，别人分不清是谁改的。`);
-  console.log(`  [MUST] Lock before editing: xteam acquire <path>; release when done; post progress via xteam say.`);
+  console.log(`xteam: ${active.length} ${t('st_sessions')} · ${locks.length} ${t('st_locks')} · ${t('st_chat')} ${chat.length}`);
+  console.log(t('st_must_lock'));
 
   for (const p of active) {
     const o = p.owner;
     const idle = now - (p.lastSeenAt || 0);
     const isMe = o === me;
     const held = heldBy[o] || [];
-    const heldStr = held.length ? held.join(', ') : '-';
-    console.log(`  [session] ${displayName(o)}${isMe ? ' [you/你]' : ''}  idle ${fmtIdle(idle)}  holding/占用: ${heldStr}`);
+    const heldStr = held.length ? held.join(', ') : t('st_none');
+    console.log(`  [session] ${displayName(o)}${isMe ? ' ' + t('st_you') : ''}  idle ${fmtIdle(idle)}  ${t('st_holding')}: ${heldStr}`);
   }
   const orphans = [];
   for (const m of locks) {
     if (active.some((p) => p.owner === m.owner)) continue; // already shown under its session
     const st = lockState(m);
     if (st.tag === 'orphaned') orphans.push(m.path);
-    const tag = st.tag === 'orphaned' ? ' (ORPHANED/无主，可接管)' : ' (会话已退出/session gone)';
+    const tag = st.tag === 'orphaned' ? t('st_orphaned_tag') : t('st_gone_tag');
     console.log(`  [lock] ${m.path}  owner=${displayName(m.owner)}  idle=${fmtIdle(st.idle)}${tag}${m.note ? ` (${m.note})` : ''}`);
   }
   if (orphans.length) {
-    console.log(`  -> ${orphans.length} 个无主锁（持有者会话已消失），可 xteam takeover 接管 / orphaned, safe to take over:`);
+    console.log(t('st_orphans_hint', { n: orphans.length }));
     for (const p of orphans) console.log(`     xteam takeover ${p}`);
   }
   for (const l of chat) console.log(`  [xteam#chat] ${l}`);
 
   const queue = listWaiters(null);
   for (const w of queue) {
-    console.log(`  [waiting] ${displayName(w.owner)} 在等 ${w.path}${w.note ? ` (${w.note})` : ''}  / waiting on ${w.path}`);
+    console.log(`  [waiting] ${displayName(w.owner)} ${t('st_waiting_on')} ${w.path}${w.note ? ` (${w.note})` : ''}`);
   }
   const mine = queue.filter((w) => w.owner === me);
   if (mine.length) {
-    console.log(`  -> 你在等 ${mine.map((w) => w.path).join(', ')}；用 xteam wait <path> 阻塞等待并自动接手 / you're queued; xteam wait auto-acquires on release`);
+    console.log(t('st_waiting_you_queued', { paths: mine.map((w) => w.path).join(', ') }));
   }
 
   const others = active.filter((p) => p.owner !== me);
   if (others.length) {
-    console.log(`  -> 现场还有 ${others.length} 个会话 / ${others.length} other session(s): ${others.map((p) => displayName(p.owner)).join(', ')}`);
-    console.log(`    相关就 xteam say 接洽，别重复做 / if related, reach out via xteam say rather than duplicating.`);
+    console.log(t('st_other_sessions', { n: others.length, names: others.map((p) => displayName(p.owner)).join(', ') }));
+    console.log(t('st_reach_out'));
   }
   if (locks.length === 0) {
-    console.log(`  -> 无锁，可自由编辑 / no locks, safe to edit. 协议/protocol: check -> acquire -> edit -> release`);
+    console.log(t('st_no_locks'));
   }
 }
 
@@ -540,11 +685,11 @@ function statusline() {
   const orphaned = locks.filter((m) => lockState(m).tag === 'orphaned').length;
   const others = active.filter((p) => p.owner !== me).length;
   const seg = [
-    `xteam ${active.length}会话·${locks.length}锁·聊${chat.length}`,
-    mine.length ? `我锁${mine.length}` : '我无锁',
+    t('sl_head', { a: active.length, l: locks.length, c: chat.length }),
+    mine.length ? t('sl_mine_locks', { n: mine.length }) : t('sl_no_locks'),
   ];
-  if (orphaned) seg.push(`无主${orphaned}`);
-  if (others) seg.push(`${others}会话在跑`);
+  if (orphaned) seg.push(t('sl_orphans', { n: orphaned }));
+  if (others) seg.push(t('sl_others', { n: others }));
   console.log(seg.join(' | '));
 }
 
@@ -832,7 +977,7 @@ async function bridgeCmd(args, opts) {
   }
 
   console.log(`BRIDGE: @${me} 驻场中 (model=${modelLabel}, digest=${digestOn ? interval + 's' : 'off'}, from seq>${lastSeq}, Ctrl+C 退出)`);
-  say(`[bridge] @${me} 驻场（跨模型桥，@${me} 或 @${name} 提问必回，模型 ${modelLabel}）`, { owner: me });
+  say(t('bridge_parked', { me, name, model: modelLabel }), { owner: me });
 
   let lastDigest = Date.now();
   for (;;) {
@@ -1117,6 +1262,7 @@ async function main() {
     case 'chat': return say(pos.join(' '), opts);
     case 'ask': return await askCmd(pos, opts);
     case 'bridge': return await bridgeCmd(pos, opts);
+    case 'i18n-gen': return await i18nGen(pos[0] || detectLang());
     case 'tail': return tailCmd(pos[0]);
     case 'preedit': return preedit();
     case 'update':
@@ -1131,4 +1277,7 @@ async function main() {
   }
 }
 
-main().catch((e) => console.log(`xteam: error: ${e.message}`));
+main().catch((e) => {
+  console.log(`xteam: error: ${e.message}`);
+  process.exitCode = 1; // 子进程调用方（如 ensurePack）靠 exit code 判定失败
+});
