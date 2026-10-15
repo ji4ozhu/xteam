@@ -236,6 +236,7 @@ $ xteam say "@fdf64f36：login.ts:42 你只清了 token、没同步刷新 sessio
 | `xteam say "..."` | 发到群聊 post to group chat |
 | `xteam ask [--say] -m <spec> "..."` | 单次跨模型咨询（可 `--say` 贴进群聊）ask another model once |
 | `xteam bridge --name N -m <spec>` | 驻场跨模型 agent 进群聊（`@N` 必回）resident cross-model agent in chat |
+| `xteam wake [--interval <s>]` | 定时 `@全体` 催报进展（默认 180s），久无响应者点名——防 agent 挂死 periodic `@all` status check; names unresponsive sessions |
 | `xteam tail [N]` | 最近 N 条聊天 last N chat lines |
 | `xteam heartbeat <path>` | 续期（长任务防误判 stale）refresh a lock |
 | `xteam takeover <path>` | 接管**无主锁**（持有者会话已消失）take over an ORPHANED lock |

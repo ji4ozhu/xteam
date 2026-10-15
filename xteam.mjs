@@ -93,6 +93,10 @@ const MSG = {
   sl_no_locks: ['我无锁', 'I hold none'],
   sl_orphans: ['无主{n}', '{n} orphaned'],
   sl_others: ['{n}会话在跑', '{n} sessions running'],
+  wake_all: ['@全体 进展检查（第{n}次）：请各会话 xteam say 一句当前进展（在做什么 / 还差多久 / 是否卡住）', '@all progress check #{n}: please xteam say your status (doing / ETA / stuck?)'],
+  wake_online: ['在线：{names}', 'online: {names}'],
+  wake_idle: ['长时间无响应：{names}', 'unresponsive: {names}'],
+  wake_none: ['（暂无其他在线会话）', '(no other sessions online)'],
 };
 const MSG_KEYS = Object.keys(MSG);
 function msgEnTable() {
@@ -1011,6 +1015,34 @@ async function bridgeCmd(args, opts) {
   }
 }
 
+// ——— wake：定时 @全体 进展检查（防 agent 超时/无响应） ———
+// 每 <interval>s 在群聊发一条 @全体 催报，消息自带在线态势（谁 idle 多久），
+// 超过一个周期没动静的会话被点名——无响应者在群里现形，而不是默默挂死。
+async function wakeCmd(opts) {
+  const interval = Math.max(30, opts.interval || 180);
+  const me = 'wake';
+  console.log(`WAKE: 每 ${interval}s @全体 进展检查 (Ctrl+C 退出 / quit)`);
+  let n = 0;
+  for (;;) {
+    n++;
+    const now = nowSec();
+    const others = listPresence().filter((p) => p.owner !== me && now - (p.lastSeenAt || 0) <= TTL);
+    const parts = [t('wake_all', { n })];
+    if (others.length) {
+      parts.push(t('wake_online', {
+        names: others.map((p) => `${displayName(p.owner)}(idle ${fmtIdle(now - (p.lastSeenAt || 0))})`).join(', '),
+      }));
+      const stale = others.filter((p) => now - (p.lastSeenAt || 0) > interval)
+        .map((p) => `@${displayName(p.owner)}`);
+      if (stale.length) parts.push(t('wake_idle', { names: stale.join(' ') }));
+    } else {
+      parts.push(t('wake_none'));
+    }
+    say(parts.join(' '), { owner: me });
+    await new Promise((r) => setTimeout(r, interval * 1000));
+  }
+}
+
 // ——— version & self-update ———
 async function download(rel) {
   const res = await fetch(`${REPO_RAW}/${rel}`);
@@ -1194,6 +1226,7 @@ Commands / 子命令:
   xteam ask [--say] [-m <spec>] <prompt>   单次跨模型咨询 / ask another model once
   xteam bridge --name <n> -m <spec> [--interval <s>] [--no-digest]
                                        驻场跨模型 agent 进群聊（@<n> 必回）/ resident cross-model agent
+  xteam wake [--interval <s>]         定时 @全体 进展检查（默认 180s，防挂死）/ periodic @all status check
   xteam tail [N]                     最近 N 条聊天 / last N chat lines (default 20)
   xteam update [--local]             更新到最新 GitHub 版本 / update to latest GitHub release
   xteam version                      版本号 / version
@@ -1262,6 +1295,7 @@ async function main() {
     case 'chat': return say(pos.join(' '), opts);
     case 'ask': return await askCmd(pos, opts);
     case 'bridge': return await bridgeCmd(pos, opts);
+    case 'wake': return await wakeCmd(opts);
     case 'i18n-gen': return await i18nGen(pos[0] || detectLang());
     case 'tail': return tailCmd(pos[0]);
     case 'preedit': return preedit();
