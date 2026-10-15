@@ -1,149 +1,96 @@
 ---
 name: xteam
-description: Coordinate file edits and share a group chat across concurrent Claude Code sessions (and Codex delegates) in the same repo. Use BEFORE editing any file or delegating edits to Codex — run `xteam check <path>`, then `xteam acquire <path>`, post progress with `xteam say "<msg>"`, and `xteam release <path>` when done (plus `xteam release --all` before you finish). A lock is only takeable when its OWNER SESSION is gone (ORPHANED) — never merely because the lock looks idle. If a path is already locked, run `xteam wait <path>` in the BACKGROUND (run_in_background=true) and end your turn — it auto-acquires the moment the holder releases and you get woken up. Trigger automatically in EVERY session (no config needed), whenever multiple sessions work in parallel, or when delegating edits to Codex.
+description: 跨会话协作 + 多模型 agent 作战室 —— 文件锁（防多会话改同一文件）、共享群聊、跨模型咨询与驻场桥（ask/bridge，让 GPT 等外部模型进群混编）、定时唤醒（wake 防 agent 挂死）、模型枚举（models）、多语言输出（i18n）。什么时候用：同一仓库开多个会话/改任何文件前/派 Codex 干活前/需要另一个模型的意见或想让 GPT 驻场群聊/多 agent 长任务怕超时无响应。SessionStart 自动激活，零配置。Coordinates file edits and shares a group chat across concurrent Claude Code sessions (and external agents like Codex/GPT); also multi-model ask/bridge, periodic wake, model listing, i18n. Use BEFORE editing any file, before delegating to Codex, when another model's opinion helps, or when long multi-agent work needs a heartbeat.
 ---
 
-# xteam — 跨会话协作（锁 + 群聊）/ cross-session coordination (locks + group chat)
+# xteam — 跨会话协作 + 多模型作战室
 
-让同一仓库里的多个并行对话（每个都可能派 Codex）协调"谁先改哪个文件"，并通过共享群聊互通进展。锁是结构化防冲突，群聊是自由文本沟通，二者互补。
+同一个仓库里多个并行会话（每个都可能派 Codex/挂 GPT）协调"谁改哪个文件"、互通进展、互相派活、跨模型互评。**锁防冲突，群聊通消息，ask/bridge 接外部大脑，wake 防挂死。** 状态在 `<repo>/.claude/xteam/`，纯 Node 零依赖，跨平台。
 
-Coordinates which parallel conversation edits which file first, and shares a group chat for progress. Locks prevent conflicts; the chat is free-form communication.
-
-## 调用方式 / Usage
+## 30 秒上手（新会话先看这段）
 
 ```bash
-node ~/.claude/skills/xteam/xteam.mjs <子命令/subcommand> [参数/args]
+node ~/.claude/skills/xteam/xteam.mjs <子命令>   # 下文简写为 xteam
 ```
 
-子命令：`status` · `check` · `acquire` · `release` · `release --all` · `wait` · `heartbeat` · `takeover` · `label` · `say` · `ask` · `bridge` · `tail` · `update` · `version` · `help`（另有 `statusline` 供状态栏自动调用）
+| 命令 | 干什么 |
+|---|---|
+| `xteam status` | 一眼看清：谁在线、谁锁着什么、群里在聊什么 |
+| `xteam acquire <path> --note "在做什么"` | 改文件前**必须**加锁（目录锁覆盖子树） |
+| `xteam release <path>` / `xteam release --all` | 改完放锁（收尾必放全部） |
+| `xteam say "..."` / `xteam tail` | 群聊发言 / 看最近消息 |
+| `xteam ask -m cli:codex "问题"` | 问另一个模型（如 GPT），秒级返回 |
+| `xteam models` | 看当前有哪些模型可用 |
 
-## 铁律 / Protocol（改任何文件 / 派 Codex 之前必须遵守）
+## 场景导航：我要做 X → 用什么
 
-0. **名 / label**：会话一开工就给自己起个短名，例如 `xteam label "改Auth功能"`，别的会话在群里就能一眼认出你是谁（显示为 `a1b2c3d4-改Auth功能`）。不设也行，会自动用你锁的 note 兜底。
-1. **查 / check**：`xteam check <path>` → 输出 `FREE` 才能动；输出 `HELD … owner=X` 就别碰。**别干等、更别硬改**：用后台 `xteam wait <path>` 排队（见下），然后去干别的。
-2. **拿 / acquire**：`xteam acquire <path> --note "<在做什么>"`（owner 自动识别，无需传；想看可读名再 `--owner A`）。锁目录会覆盖整棵子树，整模块改动锁目录。
-3. **说 / say**：`xteam say "锁了 <path>，<在做什么>，预计 <多久>"` —— 让别的对话在群里看到。
-4. **改 / edit**：正常编辑 / 派 Codex。
-5. **放 / release**：改完验证完 → `xteam release <path>`。会自动 @ 通知所有在等这把锁的会话，不用再手动喊。
-6. **收尾 / release --all**：**这一轮活干完、或你要结束回合之前，跑一次 `xteam release --all`**，把本会话所有锁一次性放掉。会话退出后没人替你放锁，别人只能干等到超时。
+| 我要… | 用法 |
+|---|---|
+| 改文件，怕和别的会话撞车 | `check` → `acquire` → 改 → `release`（铁律见下） |
+| 别人锁着我要的文件 | **后台** `xteam wait <path>` 排队，放锁自动接手（别硬改、别干等） |
+| 跟其他会话说话 / 派活 / 报进展 | `xteam say "@名字 任务…"`；看历史 `xteam tail` |
+| 问另一个模型的意见 | `xteam ask -m cli:gpt55 "…"`（route 见下） |
+| 让 GPT 常驻群聊当顾问 | 后台 `xteam bridge --name reviewer -m cli:gpt55`，群里 `@reviewer` 必回 |
+| 多 agent 长任务怕超时/挂死 | 后台 `xteam wake --interval 180`，每 3 分钟 @全体 催报，无响应者被点名 |
+| 看有哪些模型 / 确认 route 注册好没 | `xteam models` |
+| 输出想换语言 / 非中文系统怕乱码 | 自动跟随系统 locale；`XTEAM_LANG=en` 显式指定 |
+| 起个好认的名字 | `xteam label "改Auth"`（显示为 `<id>-改Auth`） |
 
-## 锁的状态怎么读 / Reading lock state（别抢正在干活的人）
+## 铁律（编辑任何文件前 / before editing）
 
-锁**不会**因为"很久没动"就能抢。判断依据是**持有者会话是否还活着**（presence 心跳），不是锁本身的空闲时长——长时间落盘（比如派 Codex 跑半小时）看起来就是"锁很久没动"。
+0. **名**：开工先 `xteam label "<任务名>"`。
+1. **查** `xteam check <path>` → `FREE` 才动；`HELD` 就别碰。
+2. **拿** `xteam acquire <path> --note "<在做什么>"`（动模块锁整个目录）。
+3. **说** `xteam say "锁了 <path>，<在做什么>，<预计>"`。
+4. **改** 正常编辑 / 派活。
+5. **放** `xteam release <path>`（自动 @ 通知排队者）。
+6. **收尾** `xteam release --all`——会话退出后没人替你放锁。
 
-`check` / `status` 会明确告诉你是哪一种：
+**锁不会因为「很久没动」就能抢**，判据是持有者会话是否还活着（presence 心跳）：
+`owner is ALIVE`（可能在长落盘，**绝不能抢**）→ 后台 wait 或群里问；
+`会话已退出` → 等到期或后台 wait；
+`ORPHANED/无主` → `xteam takeover <path>` 可安全接管。
+你自己的锁在每次 `status`/`check` 时自动续期。
 
-| 显示 | 含义 | 你该做什么 |
-|---|---|---|
-| `owner is ALIVE` / 持有者仍在线 | 会话活着，可能正在长时间落盘 | **绝不能 takeover**。后台 `xteam wait`，或 `xteam say` 问一句 |
-| `会话已退出/session gone` | 会话没了，但锁还没到期 | 后台 `xteam wait`，到期会自动提示你接管 |
-| `ORPHANED/无主` | 会话已消失且锁已过期 | 可安全 `xteam takeover <path>` |
+**wait 必须后台跑**（`run_in_background=true`）然后**结束本轮**——它 @ 持有者、排队、放锁瞬间自动接手并被 `<task-notification>` 唤醒。不要轮询、不要 sleep 守着。启动后用人话汇报再收尾：
 
-`takeover` 会自己拦住前两种，抢不动。**看到「很久没动」就断定对方挂了，是错的**——只有 `ORPHANED` 才代表无主。
+```
+Xteam: 已排队等 src/foo.cpp
+  持有者：e193b67b-改Auth（idle 17m）
+  它一放锁我自动接手，然后立刻开工。
+```
 
-你自己持有的锁会在每次 `status`/`check` 时**自动续期**，不必手动 `heartbeat`；只要你还在正常干活，锁就不会被判成无主。
+## 跨模型：ask / bridge / models
 
-## 等锁 / Waiting（别干等，也别硬改）
-
-`xteam wait <path>` —— 被别人锁着时用它，一条命令解决排队：
-
-- 自动在群聊 @ 持有者说明你在等什么，**并登记到等待队列**（对方 `xteam status` / `xteam check` 都能看到「谁在等」）；
-- 轮询等待（默认每 5s，上限 900s），对方一 `release`，**你立刻自动拿到锁**，无需再手动 acquire；
-- 如果持有者**会话已消失**（判据是 presence 心跳没了，不是"锁很久没动"），会提示你 `xteam takeover <path>` 接管，不会无限等下去；
-- 超时也不丢：等待登记保留，再跑一次 `xteam wait` 即可。
-
-### 必须用后台跑 / MUST run it in the background
-
-`wait` 会阻塞。**不要前台跑**——那会把你这一轮整整卡住 900 秒，什么都干不了。
-
-正确姿势：用 Bash 工具、**`run_in_background=true`** 启动它：
+model spec：`cli:<name>`（本地 CLI，主打 codex）· `api:<model>`（OpenAI 兼容口）· 裸模型名（=api:）。
 
 ```bash
-xteam wait crates/Wanli_Config/src/security.rs --note "STATE_VERSION 3 + 迁移"
+# route 注册（一次性，shell profile）——cli 后端每个模型一个 route
+export XTEAM_CLI_GPT55="codex exec -m gpt-5.5 -s read-only -"   # 末尾 "-" 走 stdin，零转义
+export XTEAM_LLM_API_KEY=...                                     # api 后端才需要
+
+xteam ask -m cli:gpt55 "评审这段协议设计"              # 单次咨询
+xteam bridge --name reviewer -m cli:gpt55              # 驻场：群聊 @reviewer 必回（后台跑）
+xteam models                                           # 枚举可用模型
 ```
 
-然后**结束这一轮**：去改别的没锁的文件，或者告诉用户"已排队，等 X 放锁后我自动接手"。
+- **驻场桥**显示名自动带模型前缀：`gpt55-reviewer`；`@显示名` 或 `@reviewer` 都触发。默认每 60s 把未读群聊打包征求意见（没实质贡献它回 `(silent)` 不刷屏），`--no-digest` 只回 @。**群聊即共享记忆**——外部 agent 无状态也没关系，未读喂给它、回复贴回群聊。
+- **codex 的 `-m` 写完整模型名**（`gpt-5.5-luna` 不是 `luna`）；报 `No available channel for model X` = relay 渠道没开通道，不是名字错。
+- api 后端需 `XTEAM_LLM_API_BASE`（默认 OpenAI 官方）+ `XTEAM_LLM_API_KEY`。
+- 复杂命令包一层 `.bat`/`.sh` 再指向它；`{text}` 占位在 Windows 仅纯 ASCII（推荐 stdin 模板）。
 
-- **不要** poll、不要 `sleep` 守着、不要开 agent 盯着——纯属浪费。
-- 锁一放开，`wait` 拿到锁后进程就退出，Claude Code 会用 `<task-notification>` **自动叫醒你**。
-- **被叫醒后**先看输出确认是 `ACQUIRED`（拿到了）还是 `STALE`/`TIMEOUT`（要 `takeover` 或再等），确认拿到锁了再开始落盘。
+## wake 定时唤醒（防挂死）
 
-### 必须用人话汇报 / MUST report in plain text
-
-后台任务的工具输出（`Command running in background with ID: …`）对用户是**噪音**，别把它当汇报。启动后台 `wait` 之后、结束这一轮之前，**必须**用普通文字写一句状态，让用户不点开任何东西就知道发生了什么：
-
-```
-Xteam: 已排队等 crates/Wanli_Config/src/actor.rs
-  持有者：e193b67b-增强安全 short_id 改造落盘（idle 17m）
-  我在等：save_account_tokens 放宽 XOR + auto_login 派生
-  已在群聊 @ 过对方；它一放锁我会被自动叫醒，然后立刻落盘。
+```bash
+xteam wake --interval 180   # 后台跑；默认 180s
 ```
 
-要点：**谁锁着**、**你等它干什么**、**接下来会自动发生什么**。一到四行，别贴 ID、别贴临时文件路径、别让用户去 Read output 文件。
+每周期群聊 `@全体` 催报进展，消息自带在线态势（谁 idle 多久），**超过一个周期没动静的会话被点名**——多 agent 长任务必开。
 
-被唤醒后同理，先用人话说结果：
+## i18n（输出语言）
 
-```
-Xteam: actor.rs 拿到锁了（e193b67b 已放锁），开始落盘。
-```
+跟随系统 locale（zh/en 内置模板）；其他语言首次使用时自动调一次 AI 翻译并缓存（`i18n/<lang>.json`，源不变永不重翻）；没配 LLM 回退英文（不乱码）。`XTEAM_LANG=<lang>` 显式覆盖。`help` 与群聊消息内容不翻译。
 
-或者：
+## 状态存哪 / State
 
-```
-Xteam: actor.rs 等待超时，持有者 e193b67b 仍活跃（idle 3m）。
-  我先去改 ipc.rs，稍后重新排队。
-```
-
-这和派 Codex 是同一个模式：**发起 → 结束回合 → 被自动唤醒 → 回来干活**。
-
-**别做的事**：不要因为对方"迟迟不回应"就硬改被锁的文件。要么后台 `wait`，要么等它过期后 `takeover`——两条路都会留下痕迹，改动始终可归属。
-
-## 结尾自动简报 / Auto briefing（每轮自动刷新）
-
-除了会话启动时跑一次 `xteam status`，安装时还自动配了一个**底部状态栏 statusLine**：每次 AI 回复后自动刷新**一行**紧凑简报（内部跑 `xteam statusline`，形如 `xteam 5会话·0锁·聊0 | 我无锁 | 4会话在跑`）。始终可见，扫一眼就知道几个会话在跑、自己锁没锁、有没有无主锁。
-
-它写入 `~/.claude/settings.json` 的 `statusLine` 设置，`xteam install` 或 `xteam update` 会自动刷新。新开对话即刻生效。
-
-## 共享感知 / Shared awareness（看到别人在干嘛 / see what others are doing）
-
-会话启动时 SessionStart 已经自动跑过 `xteam status`，你能看到**其他会话的名字 + 在改什么 + 最近说了什么**。别当摆设：
-
-1. **先看再动手**：改之前看一眼，有没有别的会话在做**同一件事 / 相关的事**。
-2. **别重复造轮子**：A 已经在改你正想改的东西，就别重做——`xteam say "A 在改 X，我改去 Y，等 A 放锁我接手 Z"`。
-3. **可以点评 / 接洽（基于代码）**：点评前先读对方的改动（`git diff`、或直接读相关文件——锁只禁**改**、不禁**读**），找到**具体证据**再开口。要**直接、指到具体坑**，并引用位置：`xteam say "@<对方id>：你在 login.ts:42 只清了 token、没同步刷新 session 里的 userId，登录态一过期就是 undefined，联调必 500"`。**没读代码就别点评**——别凭想象乱说，一句没证据的话比不说更糟。
-4. **干完留句话**：做完 / 放锁时 `xteam say "X 改完，思路 Y，踩了 Z 个坑"`，让别人能接着评审。
-
-看完整聊天用 `xteam tail`，看实时全景用 `xteam status`。
-
-## 跨模型 ask / bridge（多 agent 多模型协作）
-
-把外部 agent（主打 codex/GPT）拉进同一个作战室，与 Claude 会话混编协作：
-
-- **单次咨询** `xteam ask [-m <spec>] [--say] "问题"`：即问即答；`--say` 把问答贴进群聊所有会话可见。
-- **驻场桥** `xteam bridge --name <n> -m <spec> [--interval <s>] [--no-digest]`（后台跑）：
-  显示名自动带模型前缀 `<model>-<n>`（如 `codex-reviewer`），`@显示名` 或 `@<n>` 都触发、必回；
-  默认每 `<interval>`（60s）把未读群聊打包征求意见（无贡献输出 `(silent)` 则不贴），`--no-digest` 只回 @。
-  **群聊即共享记忆**——外部 agent 无状态也没关系，每轮把未读喂给它、回复贴回群聊即可。
-- **定时唤醒** `xteam wake [--interval <s>]`（后台跑，默认 180s）：每周期在群聊 `@全体` 催报进展，
-  消息自带在线态势（谁 idle 多久），超过一个周期没动静的会话被点名——防 agent 超时/无响应挂死。
-
-model spec：`api:<model>`（OpenAI 兼容口，需 `XTEAM_LLM_API_BASE` + `XTEAM_LLM_API_KEY`）· `cli:<name>`（需 `XTEAM_CLI_<NAME>` 命令模板，**推荐无占位走 stdin** 如 `codex exec -s read-only -`；`{text}`=prompt 独立 argv（Windows 下仅纯 ASCII）；`{file}`=临时文件）· 裸模型名（=api:，模型可由 `XTEAM_LLM_MODEL` 兜底）。复杂命令包一层 `.bat`/`.sh` 再指向它。
-
-**多语言 i18n**：输出语言跟随系统 locale（zh/en 内置）；其他语言首次使用时自动调一次 AI 翻译落盘 `i18n/<lang>.json`（带源 hash，模板不变永不重翻），无 LLM 配置回退英文。`XTEAM_LANG=<lang>` 显式覆盖。
-
-## 关键规则 / Key rules
-
-- **默认启用，零配置 / enabled by default, zero config**：会话启动时 SessionStart hook 自动跑 `xteam status` 输出当前所有会话状态；底部状态栏每轮回复后刷新一行简报。无需手动输入 `/xteam`。
-- **身份自动识别 / auto identity**：脚本默认用当前会话的 `CLAUDE_CODE_SESSION_ID` 前 8 位作为 owner，每个对话自动唯一、跨调用稳定。想看可读名才传 `--owner A`。
-- **锁目录优先 / prefer dir locks**：动一个模块就锁整个目录，别逐文件，省心且不漏。
-- **冲突自动提示 / auto conflict warning**：已配 PreToolUse hook——你要改的文件若被别的会话占用，编辑前会自动弹出 `[xteam] 冲突` 警告。看到就停手，改别的文件或去协调。
-- **决策要可见 / make decisions visible**：发现冲突时，把决定写清楚（"我先改 X，等 owner 放锁再回来"），并用 `say` 发到群里，让别的对话也能看到。
-- **stale 锁 / stale locks**：`HELD … (STALE)` 表示对方可能挂了没释放，用 `takeover <path> --owner <你>` 接管。
-- **长任务 / long tasks**：单次改动预计 >30 分钟，中途跑一次 `heartbeat <path>` 续期，避免被误判 stale。
-- **Codex 场景 / Codex delegation**：Claude 是指挥，Codex 落盘。派 Codex 改哪些文件，就**先锁哪些路径**，Codex 干完再放。Codex 不感知锁，所以在给 Codex 的提示词里写"只动 X 下的文件"；探索用 `-s read-only`，落盘才用 workspace-write。
-- **省 token / token economy**：看状态用 `status`（只含活会话 + 活锁 + 最近几条聊天），不要 `cat` 整个 `chat.log`；要看更多用 `tail N`。
-- **更新 / update**：`xteam update` 从 GitHub 拉最新版本并原地覆盖；`xteam version` 看版本号。或重跑安装脚本（clone / npx / curl 都行）。
-
-## 状态存哪 / State location
-
-`<repo>/.claude/xteam/`（已 gitignore，运行时数据）—— `locks/` 是锁（每个锁一个目录 + `meta.json`），`presence/` 是会话在线状态，`chat.log` 是群聊。纯文本/JSON，可直接看。
+`<repo>/.claude/xteam/`（已 gitignore）：`locks/` `presence/` `waiters/` `chat.log` `chat.seq`。锁 TTL 2700s（`XTEAM_TTL`）。底部 statusLine 每轮自动刷新简报（兼心跳）。完整帮助 `xteam help`。
